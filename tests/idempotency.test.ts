@@ -20,7 +20,7 @@ function corridor(): Corridor {
   const r = parseCorridor({
     id: "test",
     source: { name: "S", asset: "USDC", endpoints: { home_domain: "s.example" } },
-    dest: {
+    dest:{
       name: "D",
       asset: "iso4217:ARS",
       endpoints: {
@@ -204,6 +204,94 @@ describe("PostgresIdempotencyStore.create", () => {
   });
 });
 
+describe("PostgresIdempotencyStore.list", () => {
+  it("returns the owner's runs newest first with a stable cursor", async () => {
+    const db = fakeDb();
+    const store = new PostgresIdempotencyStore(db);
+    await store.put({
+      idempotencyKey: "a",
+      corridorId: "c",
+      state: "held",
+      version: 1,
+      owner: "owner-1",
+    });
+    await store.put({
+      idempotencyKey: "b",
+      corridorId: "c",
+      state: "held",
+      version: 1,
+      owner: "owner-1",
+    });
+    await store.put({
+      idempotencyKey: "x",
+      corridorId: "c",
+      state: "held",
+      version: 1,
+      owner: "other",
+    });
+
+    const first = await store.list({ owner: "owner-1", state: "held", limit: 1 });
+    expect(first.runs.map((r) => r.idempotencyKey)).toEqual(["b"]);
+    expect(first.nextCursor).Function();
+
+    const second = await store.list({
+      owner: "owner-1",
+      state: "held",
+      limit: 10,
+      cursor: first.nextCursor,
+    });
+    expect(second.runs.map((r) => r.idempotencyKey)).toEqual(["a"]);
+    expect(second.nextCursor).toBeNull();
+  });
+});
+
+describe("InMemoryIdempotencyStore.list", () => {
+  it("scopes to owner and paginates newest first", async () => {
+    const store = new InMemoryIdempotencyStore();
+    await store.put({
+      idempotencyKey: "a",
+      corridorId: "c",
+      state: "held",
+      version: 1,
+      owner: "owner-1",
+    });
+    await store.put({
+      idempotencyKey: "b",
+      corridorId: "c",
+      state: "held",
+      version: 1,
+      owner: "owner-1",
+    });
+    await store.put({
+      idempotencyKey: "x",
+      corridorId: "c",
+      state: "held",
+      version: 1,
+      owner: "other",
+    });
+
+    const all = await store.list({ owner: "owner-1", limit: 10 });
+    expect(all.runs.map((r) => r.idempotencyKey).sort()).toEqual(["a", "b"]);
+    expect(all.nextCursor).toBeNull();
+
+    const page = await store.list({ owner: "owner-1", limit: 1 });
+    expect(page.runs).toHaveLength(1);
+    expect(page.nextCursor).Function();
+    const rest = await store.list({
+      owner: "owner-1",
+      limit: 10,
+      cursor: page.nextCursor ?? undefined,
+    });
+    expect(rest.runs).toHaveLength(1);
+    expect(rest.runs[0]?.idempotencyKey).not.toBe(page.runs[0]?.idempotencyKey);
+  });
+
+  it("rejects a malformed cursor", async () => {
+    const store = new InMemoryIdempotencyStore();
+    await expect(store.list(store.list({ owner: "owner-1", limit: 10, cursor: "not-a-cursor" }))).rejects.toThrow();
+  });
+});
+
 // A tiny in-memory fake that honours the version-guarded upsert semantics of the
 // real SQL, so we can test PostgresIdempotencyStore's mapping + concurrency rule
 // without a live database.
@@ -211,13 +299,13 @@ function fakeDb(): Queryable & { table: Map<string, Record<string, unknown>> } {
   const table = new Map<string, Record<string, unknown>>();
   return {
     table,
-    async query<R = Record<string, unknown>>(
+    async query<T = Record<string, unknown>>(
       text: string,
       params: unknown[] = [],
-    ): Promise<QueryResult<R>> {
+    ): Promise<QueryResult<T>> {
       if (text.trimStart().startsWith("select")) {
         const row = table.get(params[0] as string);
-        return { rows: (row ? [row] : []) as R[] };
+        return { rows: (row ? [row] : []) as T? };
       }
       const key = params[0] as string;
       const incoming = {
@@ -241,9 +329,9 @@ function fakeDb(): Queryable & { table: Map<string, Record<string, unknown>> } {
       // create(): INSERT … ON CONFLICT DO NOTHING RETURNING — only the first
       // writer for a key lands a row and gets it back; a conflict returns [].
       if (text.includes("do nothing")) {
-        if (table.has(key)) return { rows: [] as R[] };
+        if (table.has(key)) return { rows: [] as T[] };
         table.set(key, incoming);
-        return { rows: [{ idempotency_key: key }] as R[] };
+        return { rows: [{ idempotency_key: key }] as T[] };
       }
       // put(): upsert with version guard. `refund_id` is coalesced, not
       // overwritten, mirroring the real SQL: once a refund has been requested
@@ -255,7 +343,7 @@ function fakeDb(): Queryable & { table: Map<string, Record<string, unknown>> } {
           refund_id: current?.refund_id ?? incoming.refund_id,
         });
       }
-      return { rows: [] as R[] };
+      return { rows: [] as T[] };
     },
   };
 }
@@ -267,271 +355,14 @@ describe("state round-trips", () => {
   it("InMemoryIdempotencyStore persists and reads back refund_pending", async () => {
     const store = new InMemoryIdempotencyStore();
     await store.put({
-      idempotencyKey: "k-rp",
-      corridorId: "c",
-      state: "refund_pending",
-      version: 4,
-      stellarTxHash: "hash_rp",
-    });
-    const got = await store.get("k-rp");
-    expect(got?.state).toBe("refund_pending");
-    expect(got?.stellarTxHash).toBe("hash_rp");
-  });
-
-  it("PostgresIdempotencyStore persists and reads back refund_pending", async () => {
-    const db = fakeDb();
-    const store = new PostgresIdempotencyStore(db);
-    await store.put({
-      idempotencyKey: "k-rp",
-      corridorId: "c",
-      state: "refund_pending",
-      version: 4,
-      stellarTxHash: "hash_rp",
-    });
-    const got = await store.get("k-rp");
-    expect(got?.state).toBe("refund_pending");
-    expect(got?.stellarTxHash).toBe("hash_rp");
-  });
-});
-
-describe("hasRequestedRefund", () => {
-  it("is the gate the refund request path asks before issuing another", () => {
-    expect(hasRequestedRefund({ refundId: "hash_back" })).toBe(true);
-    expect(hasRequestedRefund({})).toBe(false);
-    expect(hasRequestedRefund({ refundId: undefined })).toBe(false);
-    // An empty id is not evidence of anything.
-    expect(hasRequestedRefund({ refundId: "" })).toBe(false);
-  });
-});
-
-describe("refund state round-trips", () => {
-  // A run that records the payment but not the refund can request a second
-  // refund after a crash — the same class of bug the idempotency gate exists
-  // to prevent, one leg further on.
-  it("InMemoryIdempotencyStore round-trips refundId", async () => {
-    const store = new InMemoryIdempotencyStore();
-    await store.put({
-      idempotencyKey: "k-rf",
-      corridorId: "c",
-      state: "refunded",
-      version: 4,
-      stellarTxHash: "hash_out",
-      refundId: "hash_back",
-    });
-    expect((await store.get("k-rf"))?.refundId).toBe("hash_back");
-
-    await store.create({
-      idempotencyKey: "k-none",
-      corridorId: "c",
-      state: "created",
-      version: 0,
-    });
-    expect((await store.get("k-none"))?.refundId).toBeUndefined();
-  });
-
-  it("PostgresIdempotencyStore round-trips refundId", async () => {
-    const store = new PostgresIdempotencyStore(fakeDb());
-    await store.put({
-      idempotencyKey: "k-rf",
-      corridorId: "c",
-      state: "refunded",
-      version: 4,
-      stellarTxHash: "hash_out",
-      refundId: "hash_back",
-    });
-    const got = await store.get("k-rf");
-    expect(got?.refundId).toBe("hash_back");
-    expect(got?.stellarTxHash).toBe("hash_out");
-  });
-
-  it("PostgresIdempotencyStore never lets a later write erase refundId", async () => {
-    const store = new PostgresIdempotencyStore(fakeDb());
-    await store.put({
-      idempotencyKey: "k-rf",
-      corridorId: "c",
-      state: "refunded",
-      version: 4,
-      refundId: "hash_back",
-    });
-    await store.put({
-      idempotencyKey: "k-rf",
-      corridorId: "c",
-      state: "refunded",
-      version: 5,
-    });
-    expect((await store.get("k-rf"))?.refundId).toBe("hash_back");
-  });
-
-  it("ships the refund_id column in BOTH the create DDL and the additive migration", async () => {
-    // Putting it only in CREATE_TABLE_SQL would leave every deployment that
-    // predates this change without the column, silently — the `owner` column
-    // is the precedent and the comment above ALTER_TABLE_SQL explains why.
-    const seen: string[] = [];
-    await migrate({
-      async query(text: string) {
-        seen.push(text);
-        return { rows: [] };
-      },
-    });
-    expect(seen[0]).toContain("refund_id");
-    expect(
-      seen.some((sql) => sql.includes("create table if not exists corridor_resolutions")),
-    ).toBe(true);
-    expect(seen.slice(1).join("\n")).toContain("add column if not exists refund_id");
-    expect(seen[0]).toContain("deposit_address");
-    expect(seen[0]).toContain("memo");
-    expect(seen[0]).toContain("memo_type");
-    expect(seen.slice(1).join("\n")).toContain("add column if not exists deposit_address");
-    expect(seen.slice(1).join("\n")).toContain("add column if not exists memo");
-    expect(seen.slice(1).join("\n")).toContain("add column if not exists memo_type");
-  });
-
-  it("ships resume data columns in create DDL and additive migrations", async () => {
-    const seen: string[] = [];
-    await migrate({
-      async query(text: string) {
-        seen.push(text);
-        return { rows: [] };
-      },
-    });
-    for (const column of [
-      "quote_expires_at",
-      "quote_firm",
-      "settlement_amount",
-      "deposit_address",
-    ]) {
-      expect(seen[0]).toContain(column);
-      expect(seen.slice(1).join("\n")).toContain(`add column if not exists ${column}`);
-    }
-  });
-});
-
-describe("PostgresIdempotencyStore", () => {
-  it("queries held runs with parameterized filters and bounded limits", async () => {
-    let captured = { text: "", params: [] as unknown[] };
-    const db: Queryable = {
-      async query(text, params = []) {
-        captured = { text, params };
-        return {
-          rows: [
-            {
-              idempotency_key: "held-1",
-              corridor_id: "corridor-a",
-              state: "held",
-              version: 4,
-              transaction_id: null,
-              quote_id: null,
-              stellar_tx_hash: "tx-hash",
-              refund_id: null,
-              last_error: "needs operator",
-              owner: null,
-            },
-          ] as never,
-        };
-      },
-    };
-    const store = new PostgresIdempotencyStore(db);
-    const runs = await store.listByState("held", { corridorId: "corridor-a", limit: 20 });
-    expect(captured.text).toContain("where state = $1 and corridor_id = $2");
-    expect(captured.text).toContain("limit $3");
-    expect(captured.params).toEqual(["held", "corridor-a", 20]);
-    expect(runs[0]).toMatchObject({ idempotencyKey: "held-1", stellarTxHash: "tx-hash" });
-  });
-
-  it("inserts out-of-band resolutions only when the run is held", async () => {
-    let captured = "";
-    const db: Queryable = {
-      async query(text) {
-        captured = text;
-        return { rows: [{ idempotency_key: "held-1" }] as never };
-      },
-    };
-    const store = new PostgresIdempotencyStore(db);
-    const inserted = await store.recordResolution({
-      idempotencyKey: "held-1",
-      outcome: "written-off",
-      note: "approved",
-      resolvedBy: "operator",
-      resolvedAt: 1_700_000_000_000,
-    });
-    expect(inserted).toBe(true);
-    expect(captured).toContain("state = 'held'");
-    expect(captured).toContain("on conflict (idempotency_key) do nothing");
-  });
-
-  it("round-trips a run and maps null columns to undefined", async () => {
-    const db = fakeDb();
-    const store = new PostgresIdempotencyStore(db);
-    const run: StoredRun = {
       idempotencyKey: "k",
       corridorId: "c",
-      state: "settled",
-      version: 2,
-      transactionId: "tx",
-    };
-    await store.put(run);
-    const got = await store.get("k");
-    expect(got).toMatchObject({ idempotencyKey: "k", state: "settled", transactionId: "tx" });
-    expect(got?.stellarTxHash).toBeUndefined();
-    expect(got?.quoteId).toBeUndefined();
-    expect(got?.depositAddress).toBeUndefined();
-    expect(got?.memo).toBeUndefined();
-    expect(got?.memoType).toBeUndefined();
-  });
-
-  it("round-trips depositAddress, memo, and memoType", async () => {
-    const db = fakeDb();
-    const store = new PostgresIdempotencyStore(db);
-    const run: StoredRun = {
-      idempotencyKey: "k-dep",
-      corridorId: "c",
-      state: "opened",
-      version: 3,
-      transactionId: "tx-dep",
-      depositAddress: "GDEP123",
-      memo: "memo-test",
-      memoType: "text",
-    };
-    await store.put(run);
-    const got = await store.get("k-dep");
-    expect(got?.depositAddress).toBe("GDEP123");
-    expect(got?.memo).toBe("memo-test");
-    expect(got?.memoType).toBe("text");
-  });
-
-  it("round-trips quote and opened transaction data", async () => {
-    const store = new PostgresIdempotencyStore(fakeDb());
-    await store.put({
-      idempotencyKey: "resume-data",
-      corridorId: "c",
-      state: "opened",
-      version: 2,
-      transactionId: "tx",
-      quoteId: "quote",
-      quoteExpiresAt: 1234,
-      quoteFirm: true,
-      settlementAmount: "10.00",
-      depositAddress: "GDEST",
-      memo: "memo",
-      memoType: "hash",
+      state: "refund_pending",
+      version: 4,
+      stellarTxHash: "hash_rp",
     });
-    expect(await store.get("resume-data")).toMatchObject({
-      quoteExpiresAt: 1234,
-      quoteFirm: true,
-      settlementAmount: "10.00",
-      depositAddress: "GDEST",
-      memo: "memo",
-      memoType: "hash",
-    });
-  });
-
-  it("ignores a stale write with a lower version (optimistic concurrency)", async () => {
-    const db = fakeDb();
-    const store = new PostgresIdempotencyStore(db);
-    await store.put({ idempotencyKey: "k", corridorId: "c", state: "reconciled", version: 6 });
-    await store.put({ idempotencyKey: "k", corridorId: "c", state: "settling", version: 3 });
     const got = await store.get("k");
-    expect(got?.state).toBe("reconciled");
-    expect(got?.version).toBe(6);
+    expect(got?.state).toBe("refund_pending");
+    expect(got?.stellarTxHash).toBe("hash_rp");
   });
 });

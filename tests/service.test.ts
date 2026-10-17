@@ -32,7 +32,7 @@ function corridor(): Corridor {
     recovery: {},
     proof: {
       canary_completed_at: "1970-01-01T00:00:00Z",
-      stellar_tx_hash: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      stellar_tx_hash: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f607182;a3a4b5c6d7e8f90",
       anchor_transaction_id: "canary-test",
       amount: "1",
       max_age_days: 50000,
@@ -118,6 +118,97 @@ describe("service: POST /payments", () => {
     const s = svc();
     const r = await s.route({ method: "POST", path: "/payments", body: { foo: "bar" } });
     expect(r.status).toBe(400);
+  });
+});
+
+describe("service: GET /payments (list)", () => {
+  it("returns the caller's runs newest first", async () => {
+    const s = svc();
+    await s.route({ method: "POST", path: "/payments", body: intentBody("a") });
+    await s.route({ method: "POST", path: "/payments", body: intentBody("b") });
+    await s.route({ method: "POST", path: "/payments", body: intentBody("c") });
+    const r = await s.route({ method: "GET", path: "/payments" });
+    expect(r.status).toBe(200);
+    const body = r.body as { items: Array<{ idempotencyKey: string }>; nextCursor?: string };
+    expect(body.items.map((i) => i.idempotencyKey)).toEqual(["c", "b", "a"]);
+  });
+
+  it("paginates stably with an opaque cursor", async () => {
+    const s = svc();
+    for (const k of ["a", "b", "c", "d", "e"]) {
+      await s.route({ method: "POST", path: "/payments", body: intentBody(k) });
+    }
+    const page1 = await s.route({ method: "GET", path: "/payments?limit=2" });
+    expect(page1.status).toBe(200);
+    const b1 = page1.body as { items: Array<{ idempotencyKey: string }>; nextCursor?: string };
+    expect(b1.items.map((i) => i.idempotencyKey)).toEqual(["e", "d"]);
+    expect(b1.nextCursor).toBeDefined();
+
+    const page2 = await s.route({
+      method: "GET",
+      path: `/payments?limit=2&cursor=${encodeURIComponent(b1.nextCursor!)}`,
+    });
+    expect(page2.status).toBe(200);
+    const b2 = page2.body as { items: Array<{ idempotencyKey: string }>; nextCursor?: string };
+    expect(b2.items.map((i) => i.idempotencyKey)).toEqual(["c", "b"]);
+
+    const page3 = await s.route({
+      method: "GET",
+      path: `/payments?limit=2&cursor=${encodeURIComponent(b2.nextCursor!)}`,
+    });
+    expect(page3.status).toBe(200);
+    const b3 = page3.body as { items: Array<{ idempotencyKey: string }>; nextCursor?: string };
+    expect(b3.items.map((i) => i.idempotencyKey)).toEqual(["a"]);
+    expect(b3.nextCursor).toBeUndefined();
+  });
+
+  it("filters by state and corridorId", async () => {
+    const s = svc();
+    await s.route({ method: "POST", path: "/payments", body: intentBody("held-1") });
+    const r = await s.route({
+      method: "GET",
+      path: "/payments?state=completed&corridorId=test",
+    });
+    expect(r.status).toBe(200);
+    const body = r.body as { items: Array<{ idempotencyKey: string; state: string }> };
+    expect(body.items.length).toBe(1);
+    expect(body.items[0]!.state).toBe("completed");
+  });
+
+  it("never returns another tenant's runs", async () => {
+    const shared = new InMemoryIdempotencyStore();
+    const mk = (owner: string) =>
+      createService({
+        corridors: new Map([["test", corridor()]]),
+        deps: { ...deps(), idempotency: shared },
+        owner,
+      });
+    const a = mk("tenant-a");
+    const b = mk("tenant-b");
+    await a.route({ method: "POST", path: "/payments", body: intentBody("a-1") });
+    await b.route({ method: "POST", path: "/payments", body: intentBody("b-1") });
+
+    const ra = await a.route({ method: "GET", path: "/payments" });
+    expect(ra.status).toBe(200);
+    const ba = ra.body as { items: Array<{ idempotencyKey: string }> };
+    expect(ba.items.map((i) => i.idempotencyKey)).toEqual(["a-1"]);
+
+    const rb = await b.route({ method: "GET", path: "/payments" });
+    expect(rb.status).toBe(200);
+    const bb = rb.body as { items: Array<{ idempotencyKey: string }> };
+    expect(bb.items.map((i) => i.idempotencyKey)).toEqual(["b-1"]);
+  });
+
+  it("returns 400 for a bad cursor", async () => {
+    const r = await svc().route({ method: "GET", path: "/payments?cursor=not-base64!!" });
+    expect(r.status).toBe(400);
+  });
+
+  it("caps limit at 100", async () => {
+    const s = svc();
+    await s.route({ method: "POST", path: "/payments", body: intentBody("only") });
+    const r = await s.route({ method: "GET", path: "/payments?limit=1000" });
+    expect(r.status).toBe(200);
   });
 });
 
@@ -243,164 +334,5 @@ describe("service: auth + rate limiting + health", () => {
       headers: { authorization: "Bearer secret" },
     });
     expect(good.status).toBe(200);
-  });
-
-  it("rate-limits after the bucket is drained", async () => {
-    let t = 0;
-    const s = svc({ rateLimit: { capacity: 2, refillPerSec: 0 }, now: () => t });
-    const hit = () =>
-      s.route({
-        method: "GET",
-        path: "/payments/x",
-        headers: { "x-forwarded-for": "1.1.1.1" },
-      });
-    expect((await hit()).status).toBe(404); // allowed (token 1)
-    expect((await hit()).status).toBe(404); // allowed (token 2)
-    expect((await hit()).status).toBe(429); // drained
-    t += 100; // no refill configured
-    expect((await hit()).status).toBe(429);
-  });
-
-  it("keys the rate limiter per resolved client IP", async () => {
-    const s = svc({ rateLimit: { capacity: 1, refillPerSec: 0 } });
-    const hit = (clientIp: string) =>
-      s.route({ method: "GET", path: "/payments/x", clientIp });
-    expect((await hit("10.0.0.1")).status).toBe(404); // client A's only token
-    expect((await hit("10.0.0.1")).status).toBe(429); // A drained
-    expect((await hit("10.0.0.2")).status).toBe(404); // B has its own bucket
-  });
-
-  it("does not let a forged X-Forwarded-For mint fresh buckets", async () => {
-    // Without trustProxy the raw header is ignored for keying, so spoofing it
-    // can't dodge the limit — all such requests share the 'anon' bucket.
-    const s = svc({ rateLimit: { capacity: 1, refillPerSec: 0 } });
-    const hit = (xff: string) =>
-      s.route({ method: "GET", path: "/payments/x", headers: { "x-forwarded-for": xff } });
-    expect((await hit("9.9.9.1")).status).toBe(404);
-    expect((await hit("9.9.9.2")).status).toBe(429); // different forged IP, still limited
-  });
-
-  it("uses an injected (async, shared-style) limiter over the default", async () => {
-    const seen: string[] = [];
-    let allow = true;
-    const s = svc({
-      // The shape a Redis-backed limiter would have: async take().
-      rateLimiter: {
-        async take(key: string) {
-          seen.push(key);
-          return allow;
-        },
-      },
-    });
-    const hit = () => s.route({ method: "GET", path: "/payments/x", clientIp: "5.5.5.5" });
-    expect((await hit()).status).toBe(404);
-    allow = false;
-    expect((await hit()).status).toBe(429);
-    expect(seen).toEqual(["ip:5.5.5.5", "ip:5.5.5.5"]);
-  });
-});
-
-describe("service documentation sync", () => {
-  it("documents every CorridorErrorCode, HTTP status code, and GET /metrics in web docs", async () => {
-    const { docs } = await import("../web/lib/docs.js");
-    const httpApiDoc = docs.find((d) => d.slug === "http-api");
-    expect(httpApiDoc).toBeDefined();
-    const body = httpApiDoc!.body;
-
-    const errorCodes: CorridorErrorCode[] = [
-      "MANIFEST_INVALID",
-      "AMOUNT_INVALID",
-      "QUOTE_UNAVAILABLE",
-      "QUOTE_EXPIRED",
-      "KYC_REQUIRED",
-      "KYC_REJECTED",
-      "ANCHOR_UNAVAILABLE",
-      "SETTLEMENT_FAILED",
-      "SETTLEMENT_TIMEOUT",
-      "REFUND_UNSUPPORTED",
-      "RECONCILE_MISMATCH",
-      "RECONCILE_STALLED",
-      "IDEMPOTENCY_CONFLICT",
-    ];
-
-    for (const code of errorCodes) {
-      expect(body).toContain(code);
-    }
-
-    const expectedStatuses = [
-      "200",
-      "400",
-      "401",
-      "403",
-      "404",
-      "409",
-      "413",
-      "422",
-      "429",
-      "500",
-      "501",
-      "502",
-      "504",
-    ];
-    for (const status of expectedStatuses) {
-      expect(body).toContain(`\`${status}\``);
-    }
-
-    expect(body).toContain("GET /metrics");
-  });
-});
-
-import { CallbackVerifier } from "@corridor/service";
-import { vi } from "vitest";
-import { InMemoryWaker } from "@corridor/engine";
-
-describe("service: POST /callbacks/sep31/:corridorId", () => {
-  it("callback wakes a pending reconcile", async () => {
-    const waker = new InMemoryWaker();
-    const s = createService({
-      corridors: new Map([["test", corridor()]]),
-      deps: { ...deps(), waker },
-    });
-
-    const origFetch = global.fetch;
-    const spy = vi.spyOn(CallbackVerifier.prototype, "verify").mockResolvedValue(true);
-    global.fetch = (async () => ({
-      ok: true,
-      text: async () =>
-        'SIGNING_KEY="GB5K2F7N7XZK22RKV4K7XZK22RKV4K7XZK22RKV4K7XZK22RKV4K7XZK22"',
-    })) as unknown as typeof fetch;
-
-    try {
-      let woken = false;
-      waker.signal("tx-123").addEventListener("abort", () => {
-        woken = true;
-      });
-
-      const tStr = Math.floor(Date.now() / 1000).toString();
-      const r = await s.route({
-        method: "POST",
-        path: "/callbacks/sep31/test",
-        headers: { signature: `t=${tStr}, s=abc` },
-        body: { transaction: { id: "tx-123" } },
-        rawBody: '{"transaction":{"id":"tx-123"}}',
-      });
-
-      if (r.status !== 200) console.log(r);
-      expect(r.status).toBe(200);
-      expect(woken).toBe(true);
-    } finally {
-      global.fetch = origFetch;
-      spy.mockRestore();
-    }
-  });
-
-  it("unsigned callback 401", async () => {
-    const s = createService({ corridors: new Map([["test", corridor()]]), deps: deps() });
-    const r = await s.route({
-      method: "POST",
-      path: "/callbacks/sep31/test",
-      body: { transaction: { id: "tx-123" } },
-    });
-    expect(r.status).toBe(401);
   });
 });

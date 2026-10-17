@@ -4,7 +4,7 @@
 // hand-written fake DB. This file runs the same SQL — the atomic claim and the
 // version-guarded upsert, the two pieces that actually protect against
 // double-settlement — against a live server, so we know the real `INSERT … ON
-// CONFLICT` semantics match our assumptions.
+// CONFLICT semantics match our assumptions.
 //
 // It is opt-in: skipped unless CORRIDOR_TEST_DATABASE_URL is set. CI provides a
 // Postgres service container (see .github/workflows/ci.yml). Locally:
@@ -49,6 +49,14 @@ run("PostgresIdempotencyStore (live Postgres)", () => {
     corridorId: "c",
     state: "created",
     version: 0,
+  });
+
+  const newOwnedRun = (key: string, owner: string): StoredRun => ({
+    idempotencyKey: key,
+    corridorId: "c",
+    state: "created",
+    version: 0,
+    owner,
   });
 
   it("create() claims a key exactly once", async () => {
@@ -202,5 +210,80 @@ run("PostgresIdempotencyStore (live Postgres)", () => {
     expect(got?.quoteId).toBeUndefined();
     expect(got?.refundId).toBeUndefined();
     expect(got?.lastError).toBeUndefined();
+  });
+
+  it("list() returns only the owner's runs, newest first", async () => {
+    const s = store();
+    await s.create(newOwnedRun("a1", "alice"));
+    await s.create(newOwnedRun("a2", "alice"));
+    await s.create(newOwnedRun("b1", "bob"));
+
+    const alice = await s.list({ owner: "alice", limit: 50 });
+    expect(alice.map((r) => r.idempotencyKey).sort()).toEqual(["a1", "a2"]);
+    // Another tenant's runs never appear.
+    expect(alice.some((r) => r.idempotencyKey === "b1")).toBe(false);
+
+    const bob = await s.list({ owner: "bob", limit: 50 });
+    expect(bob.map((r) => r.idempotencyKey)).toEqual(["b1"]);
+  });
+
+  it("list() filters by state and corridorId", async () => {
+    const s = store();
+    await s.create(newOwnedRun("held-1", "alice"));
+    await s.put({
+      idempotencyKey: "held-1",
+      corridorId: "c",
+      state: "held",
+      version: 1,
+      owner: "alice",
+    });
+    await s.create(newOwnedRun("created-1", "alice"));
+
+    const held = await s.list({ owner: "alice", state: "held", limit: 50 });
+    expect(held.map((r) => r.idempotencyKey)).toEqual(["held-1"]);
+
+    const otherCorridor = await s.list({
+      owner: "alice",
+      corridorId: "nope",
+      limit: 50,
+    });
+    expect(otherCorridor).toHaveLength(0);
+  });
+
+  it("list() paginates stably with an opaque cursor", async () => {
+    const s = store();
+    for (let i = 0; i < 5; i++) {
+      await s.create(newOwnedRun(`p${i}`, "alice"));
+    }
+
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 10; page++) {
+      const res = await s.list({ owner: "alice", limit: 2, cursor });
+      seen.push(...res.map((r) => r.idempotencyKey));
+      if (res.length < 2) break;
+      // The cursor is opaque to callers; the store hands it back.
+      cursor = (res as unknown as { nextCursor?: string }).nextCursor;
+      if (!cursor) break;
+    }
+    expect(seen.sort()).toEqual(["p0", "p1", "p2", "p3", "p4"]);
+    expect(new Set(seen).size).toBe(seen.length);
+  });
+
+  it("list() rejects a malformed cursor", async () => {
+    const s = store();
+    await s.create(newOwnedRun("c1", "alice"));
+    await expect(
+      s.list({ owner: "alice", limit: 50, cursor: "not-a-cursor" }),
+    ).rejects.toThrow();
+  });
+
+  it("list() caps limit at 100", async () => {
+    const s = store();
+    for (let i = 0; i < 3; i++) {
+      await s.create(newOwnedRun(`cap${i}`, "alice"));
+    }
+    const res = await s.list({ owner: "alice", limit: 1000 });
+    expect(res.length).toBeLessThanOrEqual(100);
   });
 });

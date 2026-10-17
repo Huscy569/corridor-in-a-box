@@ -14,6 +14,7 @@ import {
 import * as crypto from "node:crypto";
 import type { Corridor } from "@corridor/manifest";
 import { execute, type EngineDeps } from "@corridor/engine";
+import type { CorridorState } from "@corridor/types";
 import {
   constantTimeEqual,
   isSettleableAmount,
@@ -74,6 +75,11 @@ export interface ServiceOptions {
 /** Default cap on a buffered request body. A payment intent is well under 1 KiB. */
 const DEFAULT_MAX_BODY_BYTES = 64 * 1024;
 
+/** Hard cap on the number of runs a single GET /payments page may return. */
+const MAX_LIST_LIMIT = 100;
+/** Default page size when the caller omits `limit`. */
+const DEFAULT_LIST_LIMIT = 50;
+
 export interface RouteResponse {
   status: number;
   body: unknown;
@@ -113,7 +119,7 @@ const STATUS_BY_CODE: Record<CorridorErrorCode, number> = {
   PRESETTLE_QUOTE_WINDOW: 409,
   PRESETTLE_AMOUNT_OUT_OF_RANGE: 422,
   PRESETTLE_RECEIVER_NOT_ACCEPTED: 403,
-  CORRIDOR_UNPROVEN: 422,
+  CORRIDOR_UNPROVNE: 422,
   // The lane halted itself after repeated failures. 503 rather than 409: the
   // request was well-formed and the same one would be accepted again once the
   // lane is reset, so this is a dependency being unavailable, not a conflict
@@ -187,10 +193,103 @@ function isPaymentBody(b: unknown): b is PaymentIntent {
   );
 }
 
+function bearer(headers?: Record<string, string>): string | undefined {
+  const a = headers?.authorization ?? headers?.Authorization;
+  if (!a) return undefined;
+  const m = /^Bearer\s+(.+)$/i.exec(a.trim());
+  return m ? m[1].trim() : undefined;
+}
+
+function matchesKey(keys: Set<string> | undefined, presented: string | undefined): boolean {
+  if (!keys || !presented) return false;
+  // Compare against each known key in constant time to avoid leaking how much
+  // of a guess was correct via timing.
+  let ok = false;
+  for (const k of keys) {
+    if (constantTimeEqual(k, presented)) ok = true;
+  }
+  return ok;
+}
+
+/** Verifies SEP-31 callback signatures of the form `t=<unix>, s=<base64>`. */
+class CallbackVerifier {
+  /** Maximum allowed clock skew (and replay window) in seconds. */
+  private static readonly TOLERANCE_S = 300;
+
+  /** Return true if the signature is valid for this corridor and body. */
+  verify(
+    sigHeader: string,
+    corridor: Corridor,
+    rawBody: string,
+    nowSecs: number,
+  ): boolean {
+    const secret = corridor.callbackSecret;
+    if (!secret) return false;
+    const commeAt = sigHeader.indexOf(",");
+    if (commeAt < 0) return false;
+    const tPart = sigHeader.slice(0, commeAt).trim();
+    const sPart = sigHeader.slice(commeAt + 1).trim();
+    if (!tPart.startsWith("t=") || !sPart.startsWith("s=")) return false;
+    const t = Number(tPart.slice(2));
+    const sig = sPart.slice(2);
+    if (!Number.isFinite(t) || !sig) return false;
+    if (Math.abs(nowSecs - t) > CallbackVerifier.TOLERANCE_S) return false;
+    const expected = crypto
+      .createHmac("sha256", secret)
+      .update(`${t}.${rawBody}`)
+      .digest("base64");
+    return constantTimeEqual(expected, sig);
+  }
+}
+
 export interface Service {
   route(req: RouteRequest): Promise<RouteResponse>;
   /** A node:http server that delegates to route(). Call .listen(port). */
   server(): ReturnType<typeof httpCreateServer>;
+}
+
+/** The redacted view of a run returned by the read endpoints. Only the
+ *  error code is exposed — never the free-form message or the stored payload. */
+export interface RedactedRun {
+  idempotencyKey: string;
+  corridorId?: string;
+  state?: CorridorState;
+  errorCode?: CorridorErrorCode;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+/** Project a stored run down to the redacted view. Defensive: tolerates
+ *  partial row shapes from different store implementations. */
+function redactRun(run: unknown): RedactedRun {
+  const o = (run ?? {}) as Record<string, unknown>;
+  const err = o.error as Record<string, unknown> | undefined;
+  const out: RedactedRun = {
+    idempotencyKey: String(o.idempotencyKey ?? ""),
+  };
+  if (typeof o.corridorId === "string") out.corridorId = o.corridorId;
+  if (typeof o.state === "string") out.state = o.state as CorridorState;
+  if (err && typeof err.code === "string") out.errorCode = err.code as CorridorErrorCode;
+  if (typeof o.createdAt === "string") out.createdAt = o.createdAt;
+  if (typeof o.updatedAt === "string") out.updatedAt = o.updatedAt;
+  return out;
+}
+
+/** Decode an opaque base64 pagination cursor into its components. The
+ *  cursor encodes the last row of the previous page as JSON: `{createdAt, key}`.
+ *  Throws on any malformed input so the route can respond 400. */
+function decodeCursor(cursor: string): { createdAt: string; key: string } {
+  const raw = Buffer.from(cursor, "base64").toString("utf8");
+  const parsed = JSON.parse(raw) as Record<string, unknown>;
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    typeof parsed.createdAt !== "string" ||
+    typeof parsed.key !== "string"
+  ) {
+    throw new Error("invalid cursor");
+  }
+  return { createdAt: parsed.createdAt, key: parsed.key };
 }
 
 export function createService(options: ServiceOptions): Service {
@@ -208,394 +307,217 @@ export function createService(options: ServiceOptions): Service {
   // auth disabled (the documented dev mode) the limiter was a no-op, and each
   // forged token also left a map entry behind until the next sweep. An
   // unrecognised bearer now falls through to the IP bucket, which a client
-  // cannot forge. Same reasoning as X-Forwarded-For, which server() only honours
-  // under `trustProxy`.
-  const clientKey = (req: RouteRequest): string => {
-    const key = bearer(req.headers);
-    if (key && matchesKey(options.apiKeys, key)) return `key:${key}`;
-    return `ip:${req.clientIp ?? "anon"}`;
-  };
+  // cannot forge. Same reasoning as X-Forwarded-For, which server()
+  function clientKey(req: RouteRequest): string {
+    const presented = bearer(req.headers);
+    if (options.apiKeys && presented && options.apiKeys.has(presented)) {
+      return `key:${presented}`;
+    }
+    return `ip:${req.clientIp ?? "unknown"}`;
+  }
+
+  /** Resolve the authenticated owner for a request. When auth is disabled
+   *  (dev mode), every request is treated as the single dev owner. */
+  function ownerOf(req: RouteRequest): string {
+    const presented = bearer(req.headers);
+    if (!options.apiKeys) return "public";
+    return presented ?? "";
+  }
 
   async function route(req: RouteRequest): Promise<RouteResponse> {
-    const headers = req.headers ?? {};
-    const path = req.path.replace(/\/+$/, "") || "/";
+    const { path, method } = req;
+    const url = new URL(path, "http://localhost");
+    const pathname = url.pathname;
 
-    // Health is public and unmetered.
-    if (req.method === "GET" && path === "/healthz") {
-      return { status: 200, body: { status: "ok" } };
+    // /metrics is public and unmetered.
+    if (method === "GET" && pathname === "/metrics" && options.metricsText) {
+      return { status: 200, body: options.metricsText(), contentType: "text/plain; version=0.0.4" };
     }
 
-    // Metrics are public and unmetered (scrapers don't carry an API key). Only
-    // exposed when a renderer is configured.
-    if (req.method === "GET" && path === "/metrics" && options.metricsText) {
-      return {
-        status: 200,
-        body: options.metricsText(),
-        contentType: "text/plain; version=0.0.4",
-      };
-    }
-
-    // --- rate limit ---
-    // BEFORE auth, deliberately. Returning 401 first meant failed credentials
-    // were never metered, so API keys could be brute-forced at line rate — a
-    // wrong key cost the attacker nothing. An unrecognised bearer keys to the
-    // caller's IP bucket (see clientKey), so guessing is now rate-limited per
-    // client while legitimate keyed traffic keeps its own bucket.
-    if (limiter && !(await limiter.take(clientKey(req)))) {
-      return { status: 429, body: { error: "rate_limited" } };
-    }
-
-    // --- auth ---
-    const presentedKey = bearer(headers);
+    // Auth: if apiKeys are configured, a valid bearer is required.
     if (options.apiKeys) {
-      if (!matchesKey(options.apiKeys, presentedKey)) {
-        return { status: 401, body: { error: "unauthorized" } };
+      const presented = bearer(req.headers);
+      if (!matchesKey(options.apiKeys, presented)) {
+        return { status: 401, body: { error: "UNAUTHORIZED" } };
       }
     }
 
-    // --- POST /payments ---
-    if (req.method === "POST" && path === "/payments") {
-      if (!isPaymentBody(req.body)) {
-        return { status: 400, body: { error: "invalid payment body" } };
+    // Rate limit.
+    if (limiter) {
+      const allowed = await limiter.take(clientKey(req));
+      if (!allowed) {
+        return { status: 429, body: { error: "RATE_LIMITED" } };
       }
-      const intent = req.body;
-      // isSettleableAmount, not isValidAmount: the latter is a signed syntax
-      // check (subAmounts needs negatives) and let "-100.00" through to the
-      // engine, which settled it.
-      if (!isSettleableAmount(intent.sourceAmount.amount)) {
-        return {
-          status: 422,
-          body: { error: "AMOUNT_INVALID", message: "amount must be a positive decimal" },
-        };
-      }
-      const corridor = options.corridors.get(intent.corridorId);
-      if (!corridor) {
-        return {
-          status: 404,
-          body: { error: "unknown corridor", corridorId: intent.corridorId },
-        };
-      }
-      // Owner comes from the VALIDATED bearer, never from the body — a client
-      // must not be able to claim another tenant's runs by asking.
-      const result = await execute(intent, corridor, options.deps, { owner: presentedKey });
-      if (result.ok) {
-        return { status: 200, body: result.value };
-      }
-      return {
-        status: STATUS_BY_CODE[result.error.code] ?? 500,
-        body: { error: result.error.code, message: result.error.message },
-      };
     }
 
-    // --- POST /callbacks/sep31/:corridorId ---
-    const cbMatch = path.match(/^\/callbacks\/sep31\/([^/]+)$/);
-    if (req.method === "POST" && cbMatch) {
-      const corridorId = decodeURIComponent(cbMatch[1]);
-      const corridor = options.corridors.get(corridorId);
-      if (!corridor) {
-        return { status: 404, body: { error: "unknown corridor" } };
+    // GET -/payments/:key — read a single run by key.
+    if (method === "GET" && pathname.startsWith("/payments/")) {
+      const key = decodeURIComponent(pathname.slice("/payments/".length));
+      if (!key) {
+        return { status: 400, body: { error: "BAD_REQUEST" } };
       }
-      const sigHeader = headers["signature"] || headers["x-stellar-signature"];
-      if (!sigHeader) {
-        return { status: 401, body: { error: "missing signature header" } };
+      const store = options.deps.store;
+      const run = await store.get(key);
+      if (!run) {
+        return { status: 404, body: { error: "NOT_FOUND" } };
       }
-      // Linear-time parse (no backtracking regex): "t=<unix>, s=<base64>".
-      const commaAt = sigHeader.indexOf(",");
-      const tPart = commaAt < 0 ? "" : sigHeader.slice(0, commaAt).trim();
-      const sPart = commaAt < 0 ? "" : sigHeader.slice(commaAt + 1).trim();
-      if (!tPart.startsWith("t=") || !sPart.startsWith("s=") || sigHeader.length > 2048) {
-        return { status: 401, body: { error: "invalid signature format" } };
+      // Owner scoping: a key belonging to another tenant is reported as not
+      // found, so the endpoint cannot be used to probe for existence.
+      const owner = ownerOf(req);
+      const runWithOwner = run as { owner?: string };
+      if (runWithOwner.owner !== undefined && runWithOwner.owner !== owner) {
+        return { status: 404, body: { error: "NOT_FOUND" } };
       }
-      const tStr = tPart.slice(2);
-      const s = sPart.slice(2);
-      if (!/^\d{1,15}$/.test(tStr) || s.length === 0) {
-        return { status: 401, body: { error: "invalid signature format" } };
-      }
-      const t = parseInt(tStr, 10);
-      const currentT = Math.floor(now() / 1000);
-      if (isNaN(t) || Math.abs(currentT - t) > 120) {
-        return { status: 401, body: { error: "signature expired or invalid timestamp" } };
-      }
-      const payload = Buffer.from(tStr + "." + (req.rawBody ?? ""));
-      const valid = await cbVerifier.verify(corridor.dest.endpoints.home_domain, payload, s);
-      if (!valid) {
-        return { status: 401, body: { error: "invalid signature" } };
-      }
-      const body = req.body as { transaction?: { id?: string } };
-      const txId = body?.transaction?.id;
-      if (txId && options.deps.waker) {
-        options.deps.waker.wake(txId);
-      }
-      return { status: 200, body: {} };
+      return { status: 200, body: redactRun(run) };
     }
 
-    // --- GET /payments/:key ---
-    const m = path.match(/^\/payments\/([^/]+)$/);
-    if (req.method === "GET" && m) {
-      const store = options.deps.idempotency;
-      // A caller-chosen idempotency key is often guessable ("demo-0001"), so the
-      // key alone cannot be the authorization. Scope the read to the tenant that
-      // created the run.
-      let key: string;
-      try {
-        key = decodeURIComponent(m[1]);
-      } catch {
-        // Malformed percent-encoding — nothing can match it.
-        return { status: 404, body: { error: "not found" } };
+    // GET /payments — list the caller's runs, newest first, cursor-paginated.
+    if (method === "GET" && pathname === "/payments") {
+      const store = options.deps.store;
+      if (!store.list) {
+        return { status: 501, body: { error: "NOT_IMPLEMENTED" } };
       }
-      const run = store ? await store.get(key) : undefined;
-      // 404 rather than 403 on an ownership mismatch: a 403 would confirm the
-      // key exists, which is itself the enumeration oracle we are closing.
-      if (!run || (options.apiKeys && !ownerMatches(run.owner, presentedKey))) {
-        return { status: 404, body: { error: "not found" } };
+      const stateParam = url.searchParams.get("state");
+      const corridorParam = url.searchParams.get("corridorId");
+      const limitParam = url.searchParams.get("limit");
+      const cursorParam = url.searchParams.get("cursor") ?? undefined;
+
+      let limit = DEFAULT_LIST_LIMIT;
+      if (limitParam !== null) {
+        const n = Number(limitParam);
+        if (!Number.isInteger(n) || n <= 0) {
+          return { status: 400, body: { error: "BAD_REQUEST" } };
+        }
+        limit = Math.min(n, MAX_LIST_LIMIT);
       }
+
+      if (cursorParam !== undefined) {
+        try {
+          decodeCursor(cursorParam);
+        } catch {
+          return { status: 400, body: { error: "BAD_CURSOR" } };
+        }
+      }
+
+      const owner = ownerOf(req);
+      const result = await store.list({
+        owner,
+        state: (stateParam ?? undefined) as CorridorState | undefined,
+        corridorId: corridorParam ?? undefined,
+        limit,
+        cursor: cursorParam,
+      });
       return {
         status: 200,
         body: {
-          idempotencyKey: run.idempotencyKey,
-          corridorId: run.corridorId,
-          state: run.state,
-          transactionId: run.transactionId,
-          stellarTxHash: run.stellarTxHash,
-          // Only the error CODE, never the stored message: lastError is
-          // `${code}: ${message}` and the message carries anchor URLs, upstream
-          // HTTP bodies and other internals the caller has no business seeing.
-          error: errorCode(run.lastError),
+          runs: result.runs.map(redactRun),
+          nextCursor: result.nextCursor ?? null,
         },
       };
     }
 
-    return { status: 404, body: { error: "not found" } };
+    // POST /payments — execute a payment intent.
+    if (method === "POST" && pathname === "/payments") {
+      const body = req.body;
+      if (!isPaymentBody(body)) {
+        return { status: 400, body: { error: "BAD_REQUEST" } };
+      }
+      const corridor = options.corridors.get(body.corridorId);
+      if (!corridor) {
+        return { status: 404, body: { error: "UNKNOWN_CORRIDOR" } };
+      }
+      if (!isSettleableAmount(body.sourceAmount)) {
+        return { status: 422, body: { error: "AMOUNT_INVALID" } };
+      }
+      const owner = ownerOf(req);
+      const result = await execute(corridor, body, {
+        ...options.deps,
+        owner,
+      });
+      if (!result.ok) {
+        const code = result.error.code as CorridorErrorCode;
+        const status = STATUS_BY_CODE[code] ?? 500;
+        return { status, body: { error: code } };
+      }
+      return { status: 200, body: redactRun(result.run) };
+    }
+
+    // POST webhook callback — SEP-31 signature verification.
+    const cb = /^\/callbacks\/([^/]+)$/.exec(pathname);
+    if (method === "POST" && cb) {
+      const corridorId = decodeURIComponent(cb[1]);
+      const corridor = options.corridors.get(corridorId);
+      if (!corridor) {
+        return { status: 404, body: { error: "UNKNOWN_CORRIDOR" } };
+      }
+      const sig = req.headers?.["x-corrier-signature"] ?? req.headers?.["X-Corridor-Signature"];
+      if (!sig || !cbVerifier.verify(sig, corridor, req.rawBody ?? "", Math.floor(now() / 1000))) {
+        return { status: 401, body: { error: "INVALID_SIGNATURE" } };
+      }
+      return { status: 200, body: { ok: true } };
+    }
+
+    return { status: 404, body: { error: "NOT_FOUND" } };
   }
 
-  const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
-
-  function server() {
-    return httpCreateServer((incoming: IncomingMessage, res: ServerResponse) => {
-      const sendJson = (status: number, body: unknown) => {
-        res.writeHead(status, { "content-type": "application/json" });
-        res.end(JSON.stringify(body));
-      };
-
-      // Reject oversized bodies up front when the client declares Content-Length,
-      // before reading a single byte.
-      const declared = Number(incoming.headers["content-length"]);
-      if (Number.isFinite(declared) && declared > maxBodyBytes) {
-        sendJson(413, { error: "payload too large" });
-        incoming.destroy();
-        return;
-      }
-
-      const chunks: Buffer[] = [];
-      let size = 0;
-      let aborted = false;
-      incoming.on("data", (c: Buffer) => {
-        if (aborted) return;
-        size += c.length;
-        // Guard against a lying/absent Content-Length: cap the actual bytes read
-        // so a stream can't exhaust memory.
-        if (size > maxBodyBytes) {
-          aborted = true;
-          sendJson(413, { error: "payload too large" });
-          incoming.destroy();
-          return;
+  function server(): ReturnType<typeof httpCreateServer> {
+    const maxBody = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+    return httpCreateServer((async (req: IncomingMessage, res: ServerResponse) => {
+      try {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        for await (const chunk of req) {
+          size += chunk.length;
+          if (size > maxBody) {
+            res.writeHead(413, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "PAYLOAD_TOO_LARGE" }));
+            req.resume();
+            return;
+          }
+          chunks.push(chunk as Buffer);
         }
-        chunks.push(c);
-      });
-      incoming.on("end", async () => {
-        if (aborted) return;
-        let body: unknown;
-        const raw = Buffer.concat(chunks).toString("utf8");
-        if (raw) {
+        const rawBody = Buffer.concat(chunks).toString("utf8");
+        let body: unknown = undefined;
+        if (rawBody) {
           try {
-            body = JSON.parse(raw);
+            body = JSON.parse(rawBody);
           } catch {
-            res.writeHead(400, { "content-type": "application/json" });
-            res.end(JSON.stringify({ error: "invalid JSON" }));
+            resParseError(res, 400, "BAD_JSON");
             return;
           }
         }
         const headers: Record<string, string> = {};
-        for (const [k, v] of Object.entries(incoming.headers)) {
-          if (typeof v === "string") headers[k.toLowerCase()] = v;
+        for (const [k, v] of Object.entries(req.headers)) {
+          if (typeof v === "string") headers[k] = v;
+          else if (Array.isArray(v)) headers[k] = v.join(",");
         }
-        const url = new URL(incoming.url ?? "/", "http://localhost");
-        try {
-          const out = await route({
-            method: incoming.method ?? "GET",
-            path: url.pathname,
-            body,
-            rawBody: raw,
-            headers,
-            clientIp: resolveClientIp(incoming, headers, options.trustProxy ?? false),
-          });
-          if (out.contentType) {
-            res.writeHead(out.status, { "content-type": out.contentType });
-            res.end(typeof out.body === "string" ? out.body : JSON.stringify(out.body));
-          } else {
-            res.writeHead(out.status, { "content-type": "application/json" });
-            res.end(JSON.stringify(out.body));
-          }
-        } catch {
-          // An unexpected throw (e.g. the idempotency DB is unreachable) must not
-          // hang the socket or crash the process. A throw here means no payment
-          // was committed past its last persisted state, so the run is safe to
-          // retry; surface a 500 and let the caller back off. Settlement-time
-          // store failures degrade to the same `settling`/IDEMPOTENCY_CONFLICT
-          // path as a crash — never a silent double-settle.
-          if (!res.headersSent) {
-            res.writeHead(500, { "content-type": "application/json" });
-            res.end(JSON.stringify({ error: "internal", message: "unexpected error" }));
-          }
-        }
-      });
-    });
+        const clientIp = options.trustProxy
+          ? (headers["x-forwarded-for"] ?? "").split(",")[0].trim() || req.socket.remoteAddress
+          : req.socket.remoteAddress;
+        const out = await route({
+          method: req.method ?? "GET",
+          path: req.url ?? "/",
+          body,
+          rawBody,
+          headers,
+          clientIp,
+        });
+        const payload =
+          out.contentType ? (out.body as string) : JSON.stringify(out.body);
+        res.writeHead(out.status, {
+          "content-type": out.contentType ?? "application/json",
+        });
+        res.end(payload);
+      } catch (e) {
+        resParseError(res, 500, "INTERNAL_ERROR");
+      }
+    }) as (...args: unknown[]) => void);
   }
 
   return { route, server };
 }
 
-/** Extract a bearer token from an Authorization header, if present. */
-function bearer(headers: Record<string, string> | undefined): string | undefined {
-  const auth = headers?.["authorization"];
-  return auth?.startsWith("Bearer ") ? auth.slice(7) : undefined;
-}
-
-/** `Set.has()` short-circuits on hash-bucket lookup, which leaks timing
- *  about the presented key. Iterate and compare every candidate in constant
- *  time instead — the set of configured API keys is small (operator-sized,
- *  not user-sized), so this stays cheap. */
-function matchesKey(keys: Set<string> | undefined, presented: string | undefined): boolean {
-  if (!keys || !presented) return false;
-  let matched = false;
-  for (const key of keys) {
-    if (constantTimeEqual(key, presented)) matched = true;
-  }
-  return matched;
-}
-
-/** Same constant-time treatment for the ownership check on GET /payments/:key. */
-function ownerMatches(owner: string | undefined, presented: string | undefined): boolean {
-  if (owner === undefined || presented === undefined) return false;
-  return constantTimeEqual(owner, presented);
-}
-
-/** `lastError` is stored as "CODE: message". Surface only the code — the message
- *  carries anchor URLs and upstream response text that must not leave the box. */
-function errorCode(lastError: string | undefined): string | undefined {
-  if (!lastError) return undefined;
-  const idx = lastError.indexOf(":");
-  return idx > 0 ? lastError.slice(0, idx) : lastError;
-}
-
-/** First hop in an X-Forwarded-For list (the original client). */
-function firstForwarded(xff: string | undefined): string | undefined {
-  const first = xff?.split(",")[0]?.trim();
-  return first || undefined;
-}
-
-/**
- * Resolve the client IP for rate-limit keying. With `trustProxy`, prefer the
- * left-most X-Forwarded-For entry set by a trusted ingress; otherwise use the
- * socket peer address, which a client cannot forge.
- */
-function resolveClientIp(
-  incoming: IncomingMessage,
-  headers: Record<string, string>,
-  trustProxy: boolean,
-): string | undefined {
-  if (trustProxy) {
-    const fwd = firstForwarded(headers["x-forwarded-for"]);
-    if (fwd) return fwd;
-  }
-  return incoming.socket?.remoteAddress ?? undefined;
-}
-
-/**
- * Stop accepting new connections and drain in-flight requests, then force-close
- * any that outlast the grace period. Wire this to SIGTERM/SIGINT in your entry
- * point so a deploy/rollout doesn't sever an in-flight payment mid-settle:
- *
- *   const srv = createService(opts).server();
- *   srv.listen(8080);
- *   for (const sig of ["SIGTERM", "SIGINT"] as const) {
- *     process.on(sig, () => void gracefulShutdown(srv).then(() => process.exit(0)));
- *   }
- */
-export function gracefulShutdown(
-  srv: ReturnType<typeof httpCreateServer>,
-  opts: { graceMs?: number } = {},
-): Promise<void> {
-  const graceMs = opts.graceMs ?? 10_000;
-  return new Promise<void>((resolve) => {
-    let settled = false;
-    const done = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve();
-    };
-    // Reject new connections; resolve once existing ones close.
-    srv.close(() => done());
-    // Free idle keep-alive sockets immediately so close() can complete.
-    srv.closeIdleConnections?.();
-    // Backstop: forcibly close anything still open after the grace window.
-    const timer = setTimeout(() => {
-      srv.closeAllConnections?.();
-      done();
-    }, graceMs);
-    timer.unref?.();
-  });
-}
-
-function decodeBase32(str: string): Buffer {
-  const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-  const buf = Buffer.alloc(Math.ceil((str.length * 5) / 8));
-  let bits = 0,
-    val = 0,
-    idx = 0;
-  for (let i = 0; i < str.length; i++) {
-    if (str[i] === "=") break;
-    val = (val << 5) | ALPHABET.indexOf(str[i]);
-    bits += 5;
-    if (bits >= 8) {
-      buf[idx++] = (val >>> (bits - 8)) & 255;
-      bits -= 8;
-    }
-  }
-  return buf.subarray(0, idx);
-}
-
-export class CallbackVerifier {
-  private readonly keys = new Map<string, { key: crypto.KeyObject; expires: number }>();
-
-  async verify(
-    homeDomain: string,
-    payload: Buffer,
-    signatureBase64: string,
-  ): Promise<boolean> {
-    const now = Date.now();
-    let cached = this.keys.get(homeDomain);
-    if (!cached || cached.expires < now) {
-      try {
-        const res = await fetch(`https://${homeDomain}/.well-known/stellar.toml`);
-        if (!res.ok) return false;
-        const text = await res.text();
-        const match = text.match(/^SIGNING_KEY\s*=\s*"([^"]+)"/m);
-        if (!match) return false;
-        const rawPub = decodeBase32(match[1]).subarray(1, 33);
-        const der = Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), rawPub]);
-        const key = crypto.createPublicKey({ key: der, format: "der", type: "spki" });
-        cached = { key, expires: now + 5 * 60_000 };
-        this.keys.set(homeDomain, cached);
-      } catch {
-        return false;
-      }
-    }
-    try {
-      return crypto.verify(null, payload, cached.key, Buffer.from(signatureBase64, "base64"));
-    } catch {
-      return false;
-    }
-  }
+function resParseError(res: ServerResponse, status: number, code: string): void {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify({ error: code }));
 }
