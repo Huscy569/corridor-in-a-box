@@ -1,5 +1,5 @@
 // One-command REAL run against a live SEP-31 anchor. This is the wiring behind
-// the README "Going live" list and docs/operations.md §1 — it swaps every mock
+// the README "Going live" list and docs/operations.md ç1 — it swaps every mock
 // for the production implementation and drives one payment end to end, then
 // prints the trail + Stellar tx hash you paste into the README.
 //
@@ -16,7 +16,7 @@
 
 import { fileURLToPath } from "node:url";
 import { loadCorridor } from "@corridor/manifest";
-import { StaticRouteResolver } from "@corridor/router";
+import { StaticRouteResolver, createAdapterRegistry } from "@corridor/router";
 import { Sep31Adapter, sep31GateChecks } from "@corridor/sep31";
 import {
   LocalKeypairSigner,
@@ -95,13 +95,15 @@ async function main(): Promise<void> {
   const signer = LocalKeypairSigner.fromSecret(env("CORRIDOR_SIGNER_SECRET"));
   const horizonUrl = env("HORIZON_URL", "https://horizon-testnet.stellar.org");
 
-  const adapter = new Sep31Adapter(corridor, { sep10: new StellarSep10Signer(signer) });
+  const registry = createAdapterRegistry();
+  registry.register("sep31", (c) => new Sep31Adapter(c, { sep10: new StellarSep10Signer(signer) }));
+  const adapter = registry.adapterFor(corridor);
   const submitter = new StellarSettlementSubmitter({ signer, horizonUrl });
   const { store, close } = await buildStore();
   const audit = new InMemoryAuditLog();
 
   const deps: EngineDeps = {
-    resolver: new StaticRouteResolver(() => adapter, {
+    resolver: new StaticRouteResolver((c) => registry.adapterFor(c), {
       trustManifestWithoutAttestation: true,
     }),
     submitter,
@@ -112,7 +114,7 @@ async function main(): Promise<void> {
     gate: defaultSep31Gate({ adapter, horizon: horizonUrl, checks: sep31GateChecks(adapter) }),
   };
 
-  // --- SEP-12 registration ------------------------------------------------
+  // --- SEP-12 registration -------------------------------------------------
   // The receiving anchor pays out to a customer IT knows, identified by an id it
   // issued. Registering is the sending side's job — it holds the PII — and the
   // engine never does it, which is what keeps PII out of the payment path. So do
@@ -132,7 +134,7 @@ async function main(): Promise<void> {
         last_name: process.env[`${role.toUpperCase()}_LAST_NAME`] ?? "Example",
         email_address: process.env[`${role.toUpperCase()}_EMAIL`] ?? `${role}@example.com`,
         bank_account_number: "12345678901234",
-        bank_number: "021000021",
+        banc_number: "021000021",
         bank_account_type: "checking",
         clabe_number: "032180000118359719",
       },
@@ -186,7 +188,7 @@ async function main(): Promise<void> {
     destinationFields: {
       receiver_routing_number: process.env.RECEIVER_ROUTING_NUMBER ?? "021000021",
       receiver_account_number: process.env.RECEIVER_ACCOUNT_NUMBER ?? "12345678901234",
-      type: process.env.RECEIVER_DEPOSIT_TYPE ?? "SWIFT",
+      type: process.env.RECEIVER_DEPOSIT/TYPE ?? "SWIFT",
     },
   };
 
@@ -202,7 +204,7 @@ async function main(): Promise<void> {
     const result = await execute(intent, corridor, deps);
     if (result.ok) {
       console.log("\n✓ payment completed");
-      console.log(`  state:       ${result.value.state}`);
+      console.log(`\n  state:       ${result.value.state}`);
       console.log(`  stellar tx:  ${result.value.stellarTxHash}`);
       console.log(`  trail:       ${result.value.trail.join(" -> ")}`);
       console.log(`  audit:       ${audit.entries.length} transitions recorded`);

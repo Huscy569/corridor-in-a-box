@@ -1,12 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { RegistryRouteResolver, StaticRouteResolver } from "@corridor/router";
+import {
+  RegistryRouteResolver,
+  StaticRouteResolver,
+  createAdapterRegistry,
+} from "@corridor/router";
 import { parseCorridor, type Corridor } from "@corridor/manifest";
 import type { AnchorAdapter } from "@corridor/adapter-kit";
 import type { PaymentIntent } from "@corridor/types";
 
-function corridor(id: string): Corridor {
-  const r = parseCorridor({
+function corridor(id: string, protocol = "sep31"): Corridor {
+  const parsed = parseCorridor( {
     id,
+    protocol,
     source: { name: "S", asset: "USDC", endpoints: { home_domain: "s.example" } },
     dest: { name: "D", asset: "iso4217:ARS", endpoints: { home_domain: "d.example" } },
     fx: { path: ["ARS", "USDC", "ARS"], who_holds_risk: "receiving_anchor" },
@@ -14,8 +19,8 @@ function corridor(id: string): Corridor {
     settlement: { network: "public", asset_issuer: "GISSUER" },
     recovery: {},
   });
-  if (!r.ok) throw new Error("fixture invalid");
-  return r.value;
+  if (!parsed.ok) throw new Error("fixture invalid");
+  return parsed.value;
 }
 
 const intent = {
@@ -106,5 +111,40 @@ describe("StaticRouteResolver", () => {
     await resolver.resolve(intent, c);
     await resolver.resolve(intent, c);
     expect(calls).toBe(2);
+  });
+});
+
+describe("createAdapterRegistry", () => {
+  it("dispatches sep31 corridors to the sep31 factory", () => {
+    const sep31Adapter = { name: "sep31" } as AnchorAdapter;
+    const registry = createAdapterRegistry();
+    registry.register("sep31", () => sep31Adapter);
+    expect(registry.adapterFor(corridor("c1", "sep31"))).toBe(sep31Adapter);
+  });
+
+  it("dispatches sep6 corridors to the sep6 factory", () => {
+    const sep6Adapter = { name: "sep6" } as AnchorAdapter;
+    const registry = createAdapterRegistry();
+    registry.register("sep6", () => sep6Adapter);
+    expect(registry.adapterFor(corridor("c1", "sep6"))).toBe(sep6Adapter);
+  });
+
+  it("dispatches custom protocols to their registered factory", () => {
+    const customAdapter = { name: "custom" } as AnchorAdapter;
+    const registry = createAdapterRegistry();
+    registry.register("custom:my-anchor", () => customAdapter);
+    expect(registry.adapterFor(corridor("c1", "custom:my-anchor"))).toBe(
+      customAdapter,
+    );
+  });
+
+  it("throws a clear startup error naming the protocol and corridor id", () => {
+    const registry = createAdapterRegistry();
+    expect(() => registry.adapterFor(corridor("c1", "sep6"))).toThrowError(
+      /sep6/,
+    );
+    expect(() => registry.adapterFor(corridor("c1", "sep6"))).toThrowError(
+      /c1/,
+    );
   });
 });

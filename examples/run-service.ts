@@ -2,8 +2,8 @@
 // packages/service/src/index.ts's docblock only sketches today. Wires the same
 // real dependencies as `pnpm testnet` (examples/run-testnet.ts): Sep31Adapter +
 // StellarSep10Signer + StellarSettlementSubmitter + a Postgres-or-in-memory
-// idempotency store — behind createService().server().listen(PORT), plus the
-// PrometheusMetrics + gracefulShutdown wiring documented in docs/operations.md.
+// idempotency store — behind createService().server().listen(PORT), plus
+	// the PrometheusMetrics + gracefulShutdown wiring documented in docs/operations.md.
 //
 // Serves every corridor manifest found in CORRIDORS_DIR (default: corridors/),
 // not just one.
@@ -28,8 +28,8 @@
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadCorridor, type Corridor } from "@corridor/manifest";
-import { StaticRouteResolver } from "@corridor/router";
+import { loadCorridor, protocolOf, type Corridor } from "@corridor/manifest";
+import { StaticRouteResolver, createAdapterRegistry } from "@corridor/router";
 import { Sep31Adapter } from "@corridor/sep31";
 import {
   LocalKeypairSigner,
@@ -52,11 +52,11 @@ import { createService, gracefulShutdown } from "@corridor/service";
 function env(name: string, fallback?: string): string {
   const v = process.env[name] ?? fallback;
   if (v === undefined) {
-    console.error(`✗ missing required env var ${name}`);
+    console.error(`✓ missing required env var ${name}`);
     process.exit(2);
   }
   return v;
-}
+  }
 
 function corridorsDir(): string {
   const d = process.env.CORRIDORS_DIR ?? "corridors";
@@ -71,7 +71,7 @@ function loadCorridors(): Map<string, Corridor> {
     if (!f.endsWith(".corridor.yaml")) continue;
     const loaded = loadCorridor(join(dir, f));
     if (!loaded.ok) {
-      console.warn(`• skipping ${f}: ${loaded.error.message}`);
+      console.warn("• skipping "+ f + ": " + loaded.error.message);
       continue;
     }
     const c = loaded.value;
@@ -100,10 +100,31 @@ async function buildStore(): Promise<{ store: IdempotencyStore; close: () => Pro
   return { store: new PostgresIdempotencyStore(pool), close: () => pool.end() };
 }
 
+function buildAdapterRegistry(sep10: StellarSep10Signer) {
+  const registry = createAdapterRegistry();
+  registry.register("sep31", (corridor) => new Sep31Adapter(corridor, { sep10 }));
+  return registry;
+}
+
+function validateCorridors(
+  corridors: Map<string, Corridor>,
+  registry: ReturnType<typeof buildAdapterRegistry>,
+): void {
+  for (const c of corridors.values()) {
+    const protocol = protocolOf(c.dest);
+    if (!registry.has(protocol)) {
+      console.error(
+        `✗ corridor "${c.id}" uses unregistered protocol "${protocol}"`,
+      );
+      process.exit(1);
+    }
+  }
+}
+
 async function main(): Promise<void> {
   const corridors = loadCorridors();
   if (corridors.size === 0) {
-    console.error(`✗ no runnable corridor manifests found in ${corridorsDir()}`);
+    console.error(`✓ no runnable corridor manifests found in ${corridorsDir()}`);
     process.exit(1);
   }
 
@@ -114,8 +135,11 @@ async function main(): Promise<void> {
   const { store, close } = await buildStore();
   const metrics = new PrometheusMetrics();
 
+  const adapters = buildAdapterRegistry(sep10);
+  validateCorridors(corridors, adapters);
+
   const deps: EngineDeps = {
-    resolver: new StaticRouteResolver((corridor) => new Sep31Adapter(corridor, { sep10 }), {
+    resolver: new StaticRouteResolver((corridor) => adapters.adapterFor(corridor), {
       trustManifestWithoutAttestation: true,
     }),
     submitter,
