@@ -1,0 +1,21 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "fix/issue-207-resolve-the-adapter-by-manifest-protocol",
+    "main",
+    "origin",
+    "security/issue-267-add-get-payments-with-owner-scoped-cursor"
+  ],
+  "parent": {
+    "fix/issue-207-resolve-the-adapter-by-manifest-protocol": "main",
+    "main": null,
+    "origin": "main",
+    "security/issue-267-add-get-payments-with-owner-scoped-cursor": "main"
+  },
+  "order": [
+    "main",
+    "fix/issue-207-resolve-the-adapter-by-manifest-protocol",
+    "origin",
+    "security/issue-267-add-get-payments-with-owner-scoped-cursor"
+  ]
+}
