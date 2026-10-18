@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { parseCorridor, type Corridor } from "@corridor/manifest";
-import { createMockAdapter } from "@corridor/adapter-kit";
+import { parseCorridor, hashCorridor, type Corridor } from "@corridor/manifest";
+import { createMockAdapter, type OpenTransaction } from "@corridor/adapter-kit";
 import { StaticRouteResolver } from "@corridor/router";
 import { amountRangeCheck } from "@corridor/sep31";
 import {
@@ -683,6 +683,109 @@ describe("engine crash resume states", () => {
     expect(r.ok).toBe(false);
     expect((await store.get(key))?.state).toBe("refunded");
     expect((await store.get(key))?.refundId).toBeTruthy();
+  });
+
+  describe("manifest pinning on crash resume", () => {
+    it("resumes normally when the manifest hash is unchanged", async () => {
+      const store = new InMemoryIdempotencyStore();
+      const key = "resume-hash-unchanged";
+      const c = corridor();
+      const hash = hashCorridor(c);
+      await store.put({
+        ...resumableRun("settled", key),
+        manifestHash: hash,
+      });
+
+      const r = await execute(intent(key), c, { ...deps(), idempotency: store });
+      expect(r.ok).toBe(true);
+      expect((await store.get(key))?.state).toBe("completed");
+    });
+
+    it("fails with MANIFEST_CHANGED before settle and does not submit payment", async () => {
+      const store = new InMemoryIdempotencyStore();
+      const key = "resume-hash-changed-before-settle";
+      const c = corridor();
+      let submitted = false;
+      const submitter = createMockSubmitter();
+      const origSubmit = submitter.submit.bind(submitter);
+      submitter.submit = async (req) => {
+        submitted = true;
+        return origSubmit(req);
+      };
+
+      // Run crashed in 'opened' state under an old manifest hash
+      await store.put({
+        ...resumableRun("opened", key),
+        stellarTxHash: undefined,
+        manifestHash: "old_manifest_hash_that_differed_from_current",
+      });
+
+      const r = await execute(intent(key), c, {
+        ...deps(),
+        submitter,
+        idempotency: store,
+      });
+
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.code).toBe("MANIFEST_CHANGED");
+        expect(r.error.message).toContain("corridor manifest changed since run opened");
+      }
+      // Submitter must never have been called: money must not move!
+      expect(submitted).toBe(false);
+      expect((await store.get(key))?.state).toBe("failed");
+    });
+
+    it("continues reconcile only and logs a warning when manifest changed after settle", async () => {
+      const store = new InMemoryIdempotencyStore();
+      const key = "resume-hash-changed-after-settle";
+      const c = corridor();
+      let submitted = false;
+      const submitter = createMockSubmitter();
+      submitter.submit = async () => {
+        submitted = true;
+        throw new Error("should not be called");
+      };
+
+      const warnings: { msg: string; fields?: Record<string, unknown> }[] = [];
+      const logger = {
+        log: (level: string, msg: string, fields?: Record<string, unknown>) => {
+          if (level === "warn") warnings.push({ msg, fields });
+        },
+      };
+
+      // Run crashed in 'settled' state under an old manifest hash
+      await store.put({
+        ...resumableRun("settled", key),
+        manifestHash: "old_manifest_hash_that_differs",
+      });
+
+      const r = await execute(intent(key), c, {
+        ...deps(),
+        submitter,
+        idempotency: store,
+        logger,
+      });
+
+      expect(r.ok).toBe(true);
+      expect((await store.get(key))?.state).toBe("completed");
+      expect(submitted).toBe(false);
+      expect(warnings.some((w) => w.msg === "corridor.manifest.changed")).toBe(true);
+    });
+
+    it("allows legacy runs without a manifest hash to resume (backward compatibility)", async () => {
+      const store = new InMemoryIdempotencyStore();
+      const key = "resume-legacy-no-hash";
+      const c = corridor();
+      await store.put({
+        ...resumableRun("settled", key),
+        manifestHash: undefined,
+      });
+
+      const r = await execute(intent(key), c, { ...deps(), idempotency: store });
+      expect(r.ok).toBe(true);
+      expect((await store.get(key))?.state).toBe("completed");
+    });
   });
 });
 
@@ -2185,8 +2288,14 @@ describe("SettlementStrategy", () => {
     mockAdapter.openTransaction = async (intent, quote, corridor) => {
       const r = await originalOpen(intent, quote, corridor);
       if (!r.ok) return r;
-      // Inject a `kind` field onto the opened tx to simulate claimable_balance.
-      return ok({ ...r.value, kind: "claimable_balance" });
+      // Return a claimable_balance deposit instruction.
+      return ok<OpenTransaction>({
+        ...r.value,
+        instructions: {
+          kind: "claimable_balance",
+          claimant: "GCLAIMANT000000000000000000000000000000000000000000000000",
+        },
+      });
     };
 
     const resolver = new StaticRouteResolver(() => mockAdapter, {
@@ -2404,4 +2513,108 @@ describe("circuit breaker x resumed recovery", () => {
       expect(row?.lastError).toContain("RECONCILE_MISMATCH");
     },
   );
+});
+
+describe("engine adapter capabilities compatibility (#188)", () => {
+  it("fails with CAPABILITY_MISMATCH when adapter reports quotes: ['none'] on quote_source: sep38 corridor before any other adapter call", async () => {
+    let quoteCalled = false;
+    let complyCalled = false;
+    let openCalled = false;
+    const adapter = createMockAdapter({
+      capabilities: { quotes: ["none"] },
+    });
+    const originalQuote = adapter.requestQuote.bind(adapter);
+    adapter.requestQuote = async (...args) => {
+      quoteCalled = true;
+      return originalQuote(...args);
+    };
+    adapter.ensureCompliance = async () => {
+      complyCalled = true;
+      return ok({ status: "accepted", customerId: "mock" });
+    };
+    adapter.openTransaction = async () => {
+      openCalled = true;
+      return ok({
+        transactionId: "mock",
+        instructions: { kind: "stellar_payment", to: "G...", memo: "memo" },
+      });
+    };
+
+    const d: EngineDeps = {
+      resolver: new StaticRouteResolver(() => adapter, {
+        trustManifestWithoutAttestation: true,
+      }),
+      submitter: createMockSubmitter(),
+      idempotency: new InMemoryIdempotencyStore(),
+      unsafeSkipPreSettleGate: true,
+    };
+
+    const r = await execute(intent("cap-quotes-none"), corridor(), d);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("CAPABILITY_MISMATCH");
+    }
+    expect(quoteCalled).toBe(false);
+    expect(complyCalled).toBe(false);
+    expect(openCalled).toBe(false);
+  });
+
+  it("fails before open when settlement kind is not covered by strategies", async () => {
+    let openCalled = false;
+    const adapter = createMockAdapter({
+      capabilities: { settlement: ["claimable_balance"] },
+    });
+    adapter.openTransaction = async () => {
+      openCalled = true;
+      return ok({
+        transactionId: "mock",
+        instructions: { kind: "stellar_payment", to: "G...", memo: "memo" },
+      });
+    };
+
+    const d: EngineDeps = {
+      resolver: new StaticRouteResolver(() => adapter, {
+        trustManifestWithoutAttestation: true,
+      }),
+      submitter: createMockSubmitter(),
+      idempotency: new InMemoryIdempotencyStore(),
+      unsafeSkipPreSettleGate: true,
+    };
+
+    const r = await execute(intent("cap-settlement-uncovered"), corridor(), d);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("CAPABILITY_MISMATCH");
+    }
+    expect(openCalled).toBe(false);
+  });
+
+  it("skips comply when caps.kyc === 'none' without calling ensureCompliance", async () => {
+    let complyCalled = false;
+    const adapter = createMockAdapter({
+      capabilities: { kyc: "none" },
+    });
+    adapter.ensureCompliance = async () => {
+      complyCalled = true;
+      return ok({ status: "accepted", customerId: "mock" });
+    };
+
+    const d: EngineDeps = {
+      resolver: new StaticRouteResolver(() => adapter, {
+        trustManifestWithoutAttestation: true,
+      }),
+      submitter: createMockSubmitter(),
+      idempotency: new InMemoryIdempotencyStore(),
+      trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
+    };
+
+    const r = await execute(intent("cap-kyc-none"), corridor(), d);
+    expect(r.ok).toBe(true);
+    expect(complyCalled).toBe(false);
+    if (r.ok) {
+      expect(r.value.state).toBe("completed");
+      expect(r.value.trail).toContain("compliant");
+    }
+  });
 });

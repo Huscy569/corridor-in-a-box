@@ -9,7 +9,7 @@
 
 import type { Corridor } from "@corridor/manifest";
 import { fail, ok, type Money, type Outcome } from "@corridor/types";
-import type { OpenTransaction, Quote } from "@corridor/adapter-kit";
+import type { DepositInstructions, OpenTransaction, Quote } from "@corridor/adapter-kit";
 import { buildSettlementRequest } from "./verbs";
 
 export interface SettlementRef {
@@ -17,6 +17,8 @@ export interface SettlementRef {
   readonly ledger?: number;
   /** Network fee actually charged, in stroops, as Horizon's `fee_charged` reports it. */
   readonly feeCharged?: string;
+  /** Stellar claimable balance id (when created via createClaimableBalance). */
+  readonly claimableBalanceId?: string;
 }
 
 export interface SettlementRequest {
@@ -120,11 +122,11 @@ export class InMemoryWaker implements ReconcileWaker {
 /**
  * The kind of deposit instructions the receiving anchor issued.
  *
- * Today only `"stellar_payment"` is used — send the bridge asset to a Stellar
- * address with an optional memo. Additional kinds (`"claimable_balance"`,
- * `"adapter_settled"`) are reserved for future work (see issue #183).
+ * Sourced directly from DepositInstructions in @corridor/adapter-kit (#183).
+ * `"stellar_payment"` sends the bridge asset to a Stellar address with an optional memo;
+ * `"claimable_balance"` creates an on-chain claimable balance for the recipient.
  */
-export type DepositInstructionsKind = "stellar_payment";
+export type DepositInstructionsKind = DepositInstructions["kind"];
 
 /**
  * Context passed to a `SettlementStrategy.settle()` call.

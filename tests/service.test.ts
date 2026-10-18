@@ -404,3 +404,164 @@ describe("service: POST /callbacks/sep31/:corridorId", () => {
     expect(r.status).toBe(401);
   });
 });
+
+import { storeCheck } from "@corridor/service";
+
+describe("service: GET /readyz", () => {
+  it("returns 200 when all checks pass", async () => {
+    const s = svc({
+      readinessChecks: [
+        { name: "db", check: async () => {} },
+        { name: "cache", check: async () => {} },
+      ],
+    });
+    const r = await s.route({ method: "GET", path: "/readyz" });
+    expect(r.status).toBe(200);
+    expect((r.body as { status: string }).status).toBe("ok");
+    const checks = (r.body as { checks: { name: string; ok: boolean }[] }).checks;
+    expect(checks).toEqual([
+      { name: "db", ok: true },
+      { name: "cache", ok: true },
+    ]);
+  });
+
+  it("returns 503 when a check throws", async () => {
+    const s = svc({
+      readinessChecks: [
+        {
+          name: "db",
+          check: async () => {
+            throw new Error("connection refused");
+          },
+        },
+      ],
+    });
+    const r = await s.route({ method: "GET", path: "/readyz" });
+    expect(r.status).toBe(503);
+    expect((r.body as { status: string }).status).toBe("degraded");
+    const checks = (r.body as { checks: { name: string; ok: boolean }[] }).checks;
+    expect(checks).toEqual([{ name: "db", ok: false }]);
+  });
+
+  it("returns 503 when a check times out", async () => {
+    const s = svc({
+      readinessChecks: [
+        // never resolves
+        { name: "slow", check: () => new Promise<void>(() => {}) },
+      ],
+      readinessTimeoutMs: 10,
+    });
+    const r = await s.route({ method: "GET", path: "/readyz" });
+    expect(r.status).toBe(503);
+    const checks = (r.body as { checks: { name: string; ok: boolean }[] }).checks;
+    expect(checks).toEqual([{ name: "slow", ok: false }]);
+  });
+
+  it("returns 200 with no checks configured", async () => {
+    const r = await svc().route({ method: "GET", path: "/readyz" });
+    expect(r.status).toBe(200);
+  });
+
+  it("returns 503 while draining even if all checks pass", async () => {
+    const s = svc({
+      readinessChecks: [{ name: "db", check: async () => {} }],
+    });
+    await s.drain();
+    const r = await s.route({ method: "GET", path: "/readyz" });
+    expect(r.status).toBe(503);
+    expect((r.body as { status: string }).status).toBe("draining");
+  });
+
+  it("is public and unmetered (rate limit does not apply)", async () => {
+    const s = svc({
+      rateLimit: { capacity: 0, refillPerSec: 0 }, // would 429 everything if metered
+    });
+    const r = await s.route({ method: "GET", path: "/readyz" });
+    // Should be 200, not 429
+    expect(r.status).toBe(200);
+  });
+
+  it("/healthz is unaffected by draining", async () => {
+    const s = svc();
+    await s.drain();
+    const r = await s.route({ method: "GET", path: "/healthz" });
+    expect(r.status).toBe(200);
+    expect((r.body as { status: string }).status).toBe("ok");
+  });
+});
+
+describe("service: drain()", () => {
+  it("new POST /payments return 503 draining after drain() is called", async () => {
+    const s = svc();
+    await s.drain();
+    const r = await s.route({ method: "POST", path: "/payments", body: intentBody() });
+    expect(r.status).toBe(503);
+    expect((r.body as { error: string }).error).toBe("draining");
+  });
+
+  it("in-flight execute() completes after drain() is called", async () => {
+    const s = createService({
+      corridors: new Map([["test", corridor()]]),
+      deps: {
+        ...deps(),
+        // Fast adapter — no real sleep needed; just verifies tracking logic
+        sleep: async () => {},
+      },
+    });
+
+    // Start a payment
+    const paymentPromise = s.route({
+      method: "POST",
+      path: "/payments",
+      body: intentBody("inflight-1"),
+    });
+
+    // Call drain while payment is still running
+    const drainPromise = s.drain();
+
+    // New payments should be rejected
+    const blockedR = await s.route({
+      method: "POST",
+      path: "/payments",
+      body: intentBody("inflight-2"),
+    });
+    expect(blockedR.status).toBe(503);
+
+    // Original payment still finishes
+    const result = await paymentPromise;
+    expect(result.status).toBe(200);
+
+    // drain() resolves once in-flight work is done
+    await drainPromise;
+
+    // Nothing is left running, so a grace-timer log would list no keys.
+    expect(s.inFlightKeys()).toEqual([]);
+  });
+
+  it("drain() resolves immediately when no payments are in-flight", async () => {
+    const s = svc();
+    // No payments started — drain should resolve right away
+    await expect(s.drain()).resolves.toBeUndefined();
+  });
+});
+
+describe("service: storeCheck helper", () => {
+  it("passes when ping resolves", async () => {
+    const check = storeCheck({ ping: async () => {} });
+    expect(check.name).toBe("store");
+    await expect(check.check()).resolves.toBeUndefined();
+  });
+
+  it("throws when ping rejects", async () => {
+    const check = storeCheck(
+      {
+        ping: async () => {
+          throw new Error("db down");
+        },
+      },
+      "pg",
+    );
+    expect(check.name).toBe("pg");
+    await expect(check.check()).rejects.toThrow("db down");
+  });
+});

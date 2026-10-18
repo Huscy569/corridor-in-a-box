@@ -5,7 +5,7 @@
 // specific fact arrives via the validated manifest, every anchor-specific fact via
 // the injected RouteResolver/adapters. Add a corridor = add a manifest.
 
-import { liveness, type Corridor, type LivenessState } from "@corridor/manifest";
+import { liveness, hashCorridor, type Corridor, type LivenessState } from "@corridor/manifest";
 import {
   compareAmounts,
   fail,
@@ -17,7 +17,14 @@ import {
   type PaymentIntent,
 } from "@corridor/types";
 import type { RouteResolver } from "@corridor/router";
-import { ExternalQuoteProvider, type ExternalQuoteFn } from "@corridor/adapter-kit";
+import {
+  AdapterQuoteProvider,
+  ExternalQuoteProvider,
+  toLegacy,
+  type ExternalQuoteFn,
+  type OpenTransaction,
+  type QuoteProvider,
+} from "@corridor/adapter-kit";
 import { canTransition, isTerminal, type CorridorState } from "./state";
 import {
   InMemoryIdempotencyStore,
@@ -48,6 +55,7 @@ import {
 } from "./verbs";
 import type { AnchorAdapter, TransactionStatus } from "@corridor/adapter-kit";
 import { defaultStrategies } from "./ports";
+import { checkCompatibility } from "./compat";
 import {
   noopMetrics,
   silentLogger,
@@ -134,6 +142,12 @@ export interface EngineDeps {
    * for those corridors; the engine never makes a SEP-38 call for them.
    */
   externalQuote?: ExternalQuoteFn;
+  /**
+   * Optional custom quote provider or factory. Overrides the default provider
+   * derived from the corridor manifest and adapter capabilities.
+   */
+  quoteProvider?:
+    QuoteProvider | ((corridor: Corridor, adapter: AnchorAdapter) => QuoteProvider);
   /**
    * Explicit escape hatch skipping pre-settle verification. When true, execute() bypasses gate
    * evaluation while recording `gate.skipped` in the audit log and emitting a warning.
@@ -336,6 +350,7 @@ export async function execute(
   const run: StoredRun = {
     idempotencyKey: intent.idempotencyKey,
     corridorId: corridor.id,
+    manifestHash: hashCorridor(corridor),
     state: "created",
     version: 0,
     owner: opts.owner,
@@ -407,6 +422,17 @@ export async function execute(
   });
   const { advance, die, finishFailure } = context;
 
+  const strategies = deps.strategies ?? defaultStrategies(deps.submitter);
+  const caps = adapter.capabilities();
+  const compat = checkCompatibility(corridor, caps, strategies);
+  if (!compat.ok) {
+    return die({
+      code: compat.error.code,
+      message: compat.error.message,
+      retryable: false,
+    });
+  }
+
   if (
     corridor.settlement.network === "public" &&
     route.trust === "manifest" &&
@@ -421,8 +447,13 @@ export async function execute(
     });
   }
 
-  let externalProvider: ExternalQuoteProvider | undefined;
-  if (corridor.fx.quote_source === "external") {
+  let provider: QuoteProvider | undefined;
+  if (deps.quoteProvider) {
+    provider =
+      typeof deps.quoteProvider === "function"
+        ? deps.quoteProvider(corridor, adapter)
+        : deps.quoteProvider;
+  } else if (corridor.fx.quote_source === "external") {
     // A non-firm external rate cannot bind the receiving anchor, so when that
     // anchor is the one holding FX risk we refuse unless it prices natively.
     if (
@@ -442,13 +473,20 @@ export async function execute(
         retryable: false,
       });
     }
-    externalProvider = new ExternalQuoteProvider(deps.externalQuote, now);
+    provider = new ExternalQuoteProvider(deps.externalQuote, now);
+  } else if (corridor.fx.quote_source === "native") {
+    if (!adapter.capabilities().quotes.includes("native")) {
+      return die({
+        code: "MANIFEST_INVALID",
+        message: `corridor ${corridor.id}: fx.quote_source "native" requires an adapter that reports native quotes`,
+        retryable: false,
+      });
+    }
+    provider = new AdapterQuoteProvider(adapter);
   }
 
   // --- 1. quote ---------------------------------------------------------
-  const q = await timed("quote", () =>
-    quote(adapter, intent, corridor, now(), externalProvider),
-  );
+  const q = await timed("quote", () => quote(adapter, intent, corridor, now(), provider));
   if (!q.ok) return die(q.error);
   run.quoteId = q.value.id;
   run.quoteExpiresAt = q.value.expiresAt;
@@ -460,8 +498,10 @@ export async function execute(
   }
 
   // --- 2. comply --------------------------------------------------------
-  const c = await timed("comply", () => comply(adapter, intent, corridor));
-  if (!c.ok) return die(c.error);
+  if (caps.kyc !== "none") {
+    const c = await timed("comply", () => comply(adapter, intent, corridor));
+    if (!c.ok) return die(c.error);
+  }
   {
     const t = await advance("compliant");
     if (!t.ok) return die(t.error);
@@ -471,9 +511,10 @@ export async function execute(
   const opened = await timed("open", () => open(adapter, intent, q.value, corridor));
   if (!opened.ok) return die(opened.error);
   run.transactionId = opened.value.transactionId;
-  run.depositAddress = opened.value.depositAddress;
-  run.memo = opened.value.memo;
-  run.memoType = opened.value.memoType;
+  const legacy = toLegacy(opened.value);
+  run.depositAddress = legacy.depositAddress;
+  run.memo = legacy.memo;
+  run.memoType = legacy.memoType;
   {
     const t = await advance("opened");
     if (!t.ok) return die(t.error);
@@ -698,14 +739,17 @@ async function emitVerification(
 type Err = { ok: false; error: CorridorError };
 
 function settlementRequestFor(
-  opened: { depositAddress: string; memo?: string; memoType?: "text" | "hash" | "id" },
+  opened:
+    | OpenTransaction
+    | { depositAddress?: string; memo?: string; memoType?: "text" | "hash" | "id" },
   q: { sourceAmount: { amount: string } },
   corridor: Corridor,
 ): SettlementRequest {
+  const legacy = "instructions" in opened ? toLegacy(opened) : opened;
   return {
-    to: opened.depositAddress,
-    memo: opened.memo,
-    memoType: opened.memoType,
+    to: legacy.depositAddress ?? "",
+    memo: legacy.memo,
+    memoType: legacy.memoType,
     amount: { asset: corridor.settlement.bridge_asset, amount: q.sourceAmount.amount },
     corridor,
   };
@@ -1081,6 +1125,37 @@ async function resumeRun(
     recordOutcome,
   });
 
+  // --- manifest pinning: fail closed if corridor configuration changed ---
+  // A run records the stable hash of the manifest it started with. If the manifest
+  // was edited after the run opened, resuming before settlement would continue
+  // under rules it was never quoted or opened with (new asset issuer, new limits,
+  // new recovery policy, different anchor endpoint).
+  //
+  // If the run has not settled, fail closed with MANIFEST_CHANGED without moving money.
+  // If it already settled, the money is already on-chain, so continue reconcile
+  // only (never re-settle) and log a warning.
+  // Legacy rows without a manifestHash are treated as legacy (allowed to resume).
+  const currentHash = hashCorridor(corridor);
+  const hashMismatch = run.manifestHash !== undefined && run.manifestHash !== currentHash;
+
+  if (hashMismatch) {
+    const hasSettled = run.state === "settled" || run.state === "reconciled";
+    if (!hasSettled) {
+      return context.die({
+        code: "MANIFEST_CHANGED",
+        message: `corridor manifest changed since run opened (${run.manifestHash} !== ${currentHash}); refusing to resume un-settled run`,
+        retryable: false,
+      });
+    }
+    (deps.logger ?? silentLogger).log("warn", "corridor.manifest.changed", {
+      idempotencyKey: run.idempotencyKey,
+      corridorId: corridor.id,
+      recordedManifestHash: run.manifestHash,
+      currentManifestHash: currentHash,
+      message: "manifest changed after settlement; resuming reconcile only",
+    });
+  }
+
   if (run.state === "created" || run.state === "quoted" || run.state === "compliant") {
     return context.die({
       code: "IDEMPOTENCY_CONFLICT",
@@ -1166,8 +1241,10 @@ async function resumeRun(
           "pre-settle gate cannot be re-evaluated on resume; operator review needed",
         );
       }
-      const compliance = await comply(route.receiving, intent, corridor);
-      if (!compliance.ok) return context.die(compliance.error);
+      if (route.receiving.capabilities().kyc !== "none") {
+        const compliance = await comply(route.receiving, intent, corridor);
+        if (!compliance.ok) return context.die(compliance.error);
+      }
       const entered = await enterSettling();
       if (!entered.ok) return context.die(entered.error);
       const submitted = await deps.submitter.submit(request);

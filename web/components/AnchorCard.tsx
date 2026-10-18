@@ -24,7 +24,7 @@ export function AnchorCard({ anchor }: { anchor: AnchorAttestation }) {
     <Card className="flex flex-col gap-4">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <div className="truncate font-mono text-sm font-semibold">{anchor.domain}</div>
+          <h3 className="truncate font-mono text-sm font-semibold">{anchor.domain}</h3>
           <div className="mt-1 text-sm text-secondary-text">
             {anchor.seps.length ? anchor.seps.map((n) => `SEP-${n}`).join(" · ") : "no SEP endpoints"}
           </div>
@@ -51,21 +51,23 @@ export function AnchorCard({ anchor }: { anchor: AnchorAttestation }) {
         {PROBE_NAMES.map((probe) => {
           const ran = anchor.probesRun.includes(probe);
           const passed = anchor.probesPassed.includes(probe);
+          // Each probe is a term and its result, so a screen reader pairs them.
+          // The result is spoken as text; the icon beside it is decoration, and
+          // "not probed" is dimmed with a lighter text colour rather than with
+          // opacity, which would take it under the contrast minimum.
           return (
             <div key={probe} className="flex items-center gap-2">
-              {!ran ? (
-                <CircleHelp size={12} className="shrink-0 text-secondary-text opacity-50" />
-              ) : passed ? (
-                <CircleCheck size={12} className="shrink-0 text-green-600" />
-              ) : (
-                <CircleSlash size={12} className="shrink-0 text-red-600" />
-              )}
-              <span className={`font-mono ${ran ? "" : "text-secondary-text opacity-50"}`}>
-                {probe}
-              </span>
-              <span className="text-secondary-text">
+              <dt className={`font-mono ${ran ? "" : "text-secondary-text"}`}>{probe}</dt>
+              <dd className="flex items-center gap-2 text-secondary-text">
+                {!ran ? (
+                  <CircleHelp size={12} className="shrink-0" />
+                ) : passed ? (
+                  <CircleCheck size={12} className="shrink-0 text-green-600" />
+                ) : (
+                  <CircleSlash size={12} className="shrink-0 text-red-600" />
+                )}
                 {!ran ? "not probed" : passed ? "passed" : "failed"}
-              </span>
+              </dd>
             </div>
           );
         })}

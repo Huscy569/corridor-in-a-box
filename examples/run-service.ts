@@ -47,7 +47,7 @@ import {
   type EngineDeps,
   type IdempotencyStore,
 } from "@corridor/engine";
-import { createService, gracefulShutdown } from "@corridor/service";
+import { createService, gracefulShutdown, storeCheck } from "@corridor/service";
 
 function env(name: string, fallback?: string): string {
   const v = process.env[name] ?? fallback;
@@ -168,6 +168,10 @@ async function main(): Promise<void> {
         }
       : undefined,
     metricsText: () => metrics.render(),
+    // Wire the idempotency store check so /readyz reports store reachability.
+    // PostgresIdempotencyStore has ping(); InMemoryIdempotencyStore does not —
+    // only register the check when the store supports it.
+    readinessChecks: "ping" in store ? [storeCheck(store as { ping(): Promise<void> })] : [],
   });
 
   const port = Number(process.env.PORT ?? "8080");
@@ -184,7 +188,7 @@ async function main(): Promise<void> {
   for (const sig of ["SIGTERM", "SIGINT"] as const) {
     process.on(sig, () => {
       console.log(`\n${sig} received, draining…`);
-      void gracefulShutdown(srv).then(async () => {
+      void gracefulShutdown(srv, service).then(async () => {
         await close();
         process.exit(0);
       });

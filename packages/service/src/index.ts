@@ -40,6 +40,17 @@ export interface RateLimiter {
   take(key: string): boolean | Promise<boolean>;
 }
 
+/**
+ * A single named readiness check. `check()` must resolve when the dependency is
+ * healthy and throw (or reject) when it is not. Throwing with an `Error` is
+ * preferred so the log entry carries a message; the body returned to callers
+ * never includes the error text.
+ */
+export interface ReadinessCheck {
+  name: string;
+  check: () => Promise<void>;
+}
+
 export interface ServiceOptions {
   /** Corridor manifests, keyed by corridor id. */
   corridors: Map<string, Corridor>;
@@ -69,10 +80,37 @@ export interface ServiceOptions {
    */
   trustProxy?: boolean;
   now?: () => number;
+  /**
+   * Optional list of readiness checks. `GET /readyz` runs each with a 5-second
+   * timeout and returns 200 when all pass, 503 when any fails. The response body
+   * lists per-check pass/fail status but never exposes internal error messages.
+   * While the service is draining (after `gracefulShutdown()` is called) `/readyz`
+   * always returns 503 so load balancers stop routing new traffic immediately.
+   */
+  readinessChecks?: ReadinessCheck[];
+  /**
+   * Timeout in milliseconds for each individual readiness check. Default 5000 ms.
+   */
+  readinessTimeoutMs?: number;
 }
 
 /** Default cap on a buffered request body. A payment intent is well under 1 KiB. */
 const DEFAULT_MAX_BODY_BYTES = 64 * 1024;
+
+/** Default per-check timeout for /readyz. */
+const DEFAULT_READINESS_TIMEOUT_MS = 5_000;
+
+/**
+ * Build a `ReadinessCheck` for a `PostgresIdempotencyStore` (or any object with
+ * a `ping(): Promise<void>` method). Wire this into `ServiceOptions.readinessChecks`
+ * so `/readyz` reports store reachability before the load balancer routes traffic:
+ *
+ *   const store = new PostgresIdempotencyStore(pool);
+ *   createService({ …, readinessChecks: [storeCheck(store)] });
+ */
+export function storeCheck(store: { ping(): Promise<void> }, name = "store"): ReadinessCheck {
+  return { name, check: () => store.ping() };
+}
 
 export interface RouteResponse {
   status: number;
@@ -94,6 +132,8 @@ export interface RouteRequest {
 
 const STATUS_BY_CODE: Record<CorridorErrorCode, number> = {
   MANIFEST_INVALID: 422,
+  MANIFEST_CHANGED: 409,
+  CAPABILITY_MISMATCH: 422,
   AMOUNT_INVALID: 422,
   QUOTE_UNAVAILABLE: 502,
   QUOTE_EXPIRED: 409,
@@ -191,6 +231,16 @@ export interface Service {
   route(req: RouteRequest): Promise<RouteResponse>;
   /** A node:http server that delegates to route(). Call .listen(port). */
   server(): ReturnType<typeof httpCreateServer>;
+  /**
+   * Signal the service to start draining. After this call:
+   * - `GET /readyz` returns 503 immediately (load balancers stop routing).
+   * - New `POST /payments` return 503 `{error:"draining"}`.
+   * - In-flight `execute()` calls are allowed to finish.
+   * Returns a Promise that resolves once all in-flight executions have settled.
+   */
+  drain(): Promise<void>;
+  /** Idempotency keys of the `execute()` calls still running right now. */
+  inFlightKeys(): string[];
 }
 
 export function createService(options: ServiceOptions): Service {
@@ -199,6 +249,28 @@ export function createService(options: ServiceOptions): Service {
     options.rateLimiter ??
     (options.rateLimit ? new TokenBucket(options.rateLimit, now) : undefined);
   const cbVerifier = new CallbackVerifier();
+  const readinessTimeoutMs = options.readinessTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS;
+
+  // --- draining state --------------------------------------------------
+  // Set true by drain(). Once set it is never cleared: a draining instance
+  // keeps its load-balancer weight at zero and rejects new payments until the
+  // process exits.
+  let draining = false;
+
+  // Track every in-flight execute() promise so drain() can wait for them all.
+  // Keys are idempotency keys (for logging on grace-timer fire).
+  const inFlight = new Map<string, Promise<unknown>>();
+
+  function trackExecution(idempotencyKey: string, p: Promise<unknown>): void {
+    inFlight.set(idempotencyKey, p);
+    void p.finally(() => inFlight.delete(idempotencyKey));
+  }
+
+  function drain(): Promise<void> {
+    draining = true;
+    if (inFlight.size === 0) return Promise.resolve();
+    return Promise.all([...inFlight.values()]).then(() => undefined);
+  }
 
   // Rate-limit identity: a VALIDATED API key if present (most specific), else
   // the client IP resolved by the transport.
@@ -220,9 +292,39 @@ export function createService(options: ServiceOptions): Service {
     const headers = req.headers ?? {};
     const path = req.path.replace(/\/+$/, "") || "/";
 
-    // Health is public and unmetered.
+    // Health is public and unmetered. Always 200 — liveness only.
     if (req.method === "GET" && path === "/healthz") {
       return { status: 200, body: { status: "ok" } };
+    }
+
+    // Readiness is public and unmetered. Returns 503 while draining or when any
+    // check fails, 200 when all checks pass. The body lists per-check results but
+    // never surfaces internal error messages — no anchor URLs, no stack traces.
+    if (req.method === "GET" && path === "/readyz") {
+      if (draining) {
+        return { status: 503, body: { status: "draining", checks: [] } };
+      }
+      const checks = options.readinessChecks ?? [];
+      const results = await Promise.all(
+        checks.map(async ({ name, check }) => {
+          try {
+            await Promise.race([
+              check(),
+              new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error("timeout")), readinessTimeoutMs),
+              ),
+            ]);
+            return { name, ok: true };
+          } catch {
+            return { name, ok: false };
+          }
+        }),
+      );
+      const allOk = results.every((r) => r.ok);
+      return {
+        status: allOk ? 200 : 503,
+        body: { status: allOk ? "ok" : "degraded", checks: results },
+      };
     }
 
     // Metrics are public and unmetered (scrapers don't carry an API key). Only
@@ -255,6 +357,11 @@ export function createService(options: ServiceOptions): Service {
 
     // --- POST /payments ---
     if (req.method === "POST" && path === "/payments") {
+      // Refuse new payments while draining. In-flight ones that already started
+      // will run to completion; only new arrivals are blocked.
+      if (draining) {
+        return { status: 503, body: { error: "draining" } };
+      }
       if (!isPaymentBody(req.body)) {
         return { status: 400, body: { error: "invalid payment body" } };
       }
@@ -277,7 +384,9 @@ export function createService(options: ServiceOptions): Service {
       }
       // Owner comes from the VALIDATED bearer, never from the body — a client
       // must not be able to claim another tenant's runs by asking.
-      const result = await execute(intent, corridor, options.deps, { owner: presentedKey });
+      const p = execute(intent, corridor, options.deps, { owner: presentedKey });
+      trackExecution(intent.idempotencyKey, p);
+      const result = await p;
       if (result.ok) {
         return { status: 200, body: result.value };
       }
@@ -452,7 +561,7 @@ export function createService(options: ServiceOptions): Service {
     });
   }
 
-  return { route, server };
+  return { route, server, drain, inFlightKeys: () => [...inFlight.keys()] };
 }
 
 /** Extract a bearer token from an Authorization header, if present. */
@@ -516,17 +625,41 @@ function resolveClientIp(
  * any that outlast the grace period. Wire this to SIGTERM/SIGINT in your entry
  * point so a deploy/rollout doesn't sever an in-flight payment mid-settle:
  *
- *   const srv = createService(opts).server();
+ *   const svc = createService(opts);
+ *   const srv = svc.server();
  *   srv.listen(8080);
  *   for (const sig of ["SIGTERM", "SIGINT"] as const) {
- *     process.on(sig, () => void gracefulShutdown(srv).then(() => process.exit(0)));
+ *     process.on(sig, () => void gracefulShutdown(srv, svc).then(() => process.exit(0)));
  *   }
+ *
+ * Pass `svc` as the second argument so the shutdown sequence:
+ *   1. Signals the service to drain — `/readyz` immediately returns 503 and new
+ *      POST /payments are rejected, stopping the load balancer from routing new
+ *      traffic while existing payments finish.
+ *   2. Waits for all in-flight `execute()` calls to settle.
+ *   3. Stops the HTTP server from accepting new connections and closes idle sockets.
+ *   4. Force-closes any remaining connections once the grace window expires,
+ *      logging the idempotency keys still running so operators can investigate.
  */
 export function gracefulShutdown(
   srv: ReturnType<typeof httpCreateServer>,
-  opts: { graceMs?: number } = {},
+  svcOrOpts?: Service | { graceMs?: number },
+  legacyOpts: { graceMs?: number } = {},
 ): Promise<void> {
+  // Support both old signature gracefulShutdown(srv, opts) and new
+  // gracefulShutdown(srv, svc, opts) so existing callers keep working.
+  let svc: Service | undefined;
+  let opts: { graceMs?: number };
+  if (svcOrOpts && "drain" in svcOrOpts) {
+    svc = svcOrOpts as Service;
+    opts = legacyOpts;
+  } else {
+    svc = undefined;
+    opts = (svcOrOpts as { graceMs?: number } | undefined) ?? {};
+  }
+
   const graceMs = opts.graceMs ?? 10_000;
+
   return new Promise<void>((resolve) => {
     let settled = false;
     const done = () => {
@@ -535,12 +668,27 @@ export function gracefulShutdown(
       clearTimeout(timer);
       resolve();
     };
-    // Reject new connections; resolve once existing ones close.
+
+    // 1. Tell the service to drain — /readyz goes 503 and new payments are
+    //    blocked immediately, before we wait for anything.
+    if (svc) void svc.drain();
+
+    // 2. Stop accepting new HTTP connections; wait for existing ones to close.
     srv.close(() => done());
-    // Free idle keep-alive sockets immediately so close() can complete.
+    // Free idle keep-alive sockets so srv.close() can complete promptly.
     srv.closeIdleConnections?.();
-    // Backstop: forcibly close anything still open after the grace window.
+
+    // 3. Backstop: after the grace window, force-close everything still open.
     const timer = setTimeout(() => {
+      // Log the keys still running so operators know what was mid-settle when we cut.
+      if (svc) {
+        const keys = svc.inFlightKeys();
+        process.stderr.write(
+          `[corridor/service] graceful-shutdown grace period (${graceMs}ms) expired, ` +
+            `force-closing connections. In-flight idempotency keys: ` +
+            `${keys.length > 0 ? keys.join(", ") : "none"}\n`,
+        );
+      }
       srv.closeAllConnections?.();
       done();
     }, graceMs);

@@ -20,6 +20,16 @@ import { isSafeUrl } from "./url-safety";
 
 export { tomlHash } from "./toml-hash";
 export { isSafeUrl } from "./url-safety";
+export { renderSweepMarkdown, renderSweepJson, isUsableSep31OffRamp } from "./report";
+export {
+  ANCHOR_KINDS,
+  isValidAnchorDomain,
+  loadFleet,
+  parseFleet,
+  type AnchorEntry,
+  type AnchorFleet,
+  type AnchorKind,
+} from "./fleet";
 
 /** SEP numbers in registry bit order. Must match SEP_NUMBERS in contracts/registry. */
 export const SEP_NUMBERS = [1, 6, 10, 12, 24, 31, 38] as const;
@@ -30,6 +40,8 @@ export const PROBE_NAMES = [
   "sep38_quote",
   "sep12_status",
   "sep31_info",
+  "sep6_info",
+  "sep6_auth",
 ] as const;
 
 export type SepNumber = (typeof SEP_NUMBERS)[number];
@@ -64,6 +76,10 @@ export interface ProbeResult {
   readonly tomlHash: string;
   /** Per-probe detail, in the order probes were attempted. */
   readonly outcomes: readonly ProbeOutcome[];
+  /** Receive assets accepted by the anchor if SEP-31 probe passed. */
+  readonly receiveAssets?: readonly string[];
+  /** Raw text of stellar.toml if successfully fetched. */
+  readonly toml?: string;
 }
 
 export interface ProbeOptions {
@@ -79,7 +95,7 @@ export interface ProbeOptions {
 const ZERO_HASH = "0".repeat(64);
 
 /** Endpoint keys in a stellar.toml, and which SEP each one implies. */
-const TOML_ENDPOINTS: ReadonlyArray<{ key: string; sep: SepNumber }> = [
+export const TOML_ENDPOINTS: ReadonlyArray<{ key: string; sep: SepNumber }> = [
   { key: "TRANSFER_SERVER", sep: 6 },
   { key: "WEB_AUTH_ENDPOINT", sep: 10 },
   { key: "KYC_SERVER", sep: 12 },
@@ -213,11 +229,12 @@ export async function probeAnchor(
       const buy = info.assets?.find((a) => a.asset.startsWith("iso4217:"));
       if (!sell || !buy) throw new Error("no stellar→fiat pair advertised");
 
+      const context = endpoint.has(6) && !endpoint.has(31) ? "sep6" : "sep31";
       const res = await get(`${sep38}/quote`, {
         method: "POST",
         headers: { "content-type": "application/json", ...authHeader },
         body: JSON.stringify({
-          context: "sep31",
+          context,
           sell_asset: sell.asset,
           buy_asset: buy.asset,
           sell_amount: "10",
@@ -251,6 +268,7 @@ export async function probeAnchor(
   }
 
   // --- SEP-31: does it receive anything? ---------------------------------
+  let receiveAssets: string[] | undefined;
   const sep31 = endpoint.get(31);
   if (sep31) {
     try {
@@ -263,13 +281,69 @@ export async function probeAnchor(
         // exists, the lane does not.
         throw new Error("receive list is EMPTY — advertises SEP-31 but accepts nothing");
       }
+      receiveAssets = assets;
       record("sep31_info", true, `receives ${assets.join(", ")}`);
     } catch (e) {
       record("sep31_info", false, why(e));
     }
   }
 
-  return { domain, seps, probesRun, probesPassed, tomlHash, outcomes };
+  // --- SEP-6: does the transfer server withdraw anything? ----------------
+  const sep6 = endpoint.get(6);
+  let sep6Asset: string | undefined;
+  if (sep6) {
+    try {
+      const res = await get(`${sep6}/info`, { headers: authHeader });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      type Sep6Section = Record<string, { enabled?: boolean }>;
+      const j = (await res.json()) as {
+        withdraw?: Sep6Section;
+        "withdraw-exchange"?: Sep6Section;
+      };
+      // SEP-6 requires `enabled` on every asset; an asset that is not explicitly
+      // enabled is not a working lane, the same way an empty SEP-31 receive list is not.
+      const enabled = (section: Sep6Section | undefined) =>
+        Object.entries(section ?? {})
+          .filter(([, v]) => v?.enabled === true)
+          .map(([code]) => code);
+      const assets = [
+        ...new Set([...enabled(j.withdraw), ...enabled(j["withdraw-exchange"])]),
+      ];
+      if (assets.length === 0) {
+        throw new Error("withdraw list is EMPTY — advertises SEP-6 but withdraws nothing");
+      }
+      sep6Asset = assets[0];
+      record("sep6_info", true, `withdraws ${assets.join(", ")}`);
+    } catch (e) {
+      record("sep6_info", false, why(e));
+    }
+  }
+
+  // --- SEP-6 auth: an authenticated read, not just a public /info --------
+  if (sep6 && token && sep6Asset) {
+    try {
+      const res = await get(
+        `${sep6}/transactions?asset_code=${encodeURIComponent(sep6Asset)}`,
+        { headers: authHeader },
+      );
+      // As with SEP-12: a 4xx is a valid SEP-6 answer, a 5xx is not.
+      if (res.status >= 500) throw new Error(`HTTP ${res.status}`);
+      record("sep6_auth", true, `HTTP ${res.status}`);
+    } catch (e) {
+      record("sep6_auth", false, why(e));
+    }
+  }
+
+  return {
+    domain,
+    seps,
+    probesRun,
+    probesPassed,
+    tomlHash,
+    outcomes,
+    toml,
+    ...(receiveAssets ? { receiveAssets } : {}),
+  };
 }
 
 export interface FormattedProbeResultJson {
@@ -319,3 +393,6 @@ export function parseProbeArgs(args: readonly string[]): { domain?: string; json
   }
   return { domain, json };
 }
+
+export * from "./report";
+export * from "./loader";

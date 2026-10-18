@@ -11,6 +11,26 @@ running migrations, and the project's versioning/release policy.
 > Treat this runbook as the plan for a self-run testnet/close-beta pilot, not a
 > claim of production-readiness.
 
+## 0. Adding an anchor to the fleet
+
+`contracts/anchors.json` is the fleet's curated list of anchors. It is **not**
+seeded automatically from the Stellar Anchor Directory (anchors.stellar.org):
+the directory is a human-facing web app with no documented machine-readable
+feed, so every entry is a deliberate, reviewed addition. Never invent a domain —
+every entry must come from the directory or the anchor's own site.
+
+To add an anchor:
+
+1. Find it on [anchors.stellar.org](https://anchors.stellar.org) and open its
+   `stellar.toml` (`https://<home-domain>/.well-known/stellar.toml`).
+2. Record the home domain, the countries and currencies it serves, and the SEPs
+   it claims (`TRANSFER_SERVER_SEP0031`, `ANCHOR_QUOTE_SERVER`, `KYC_SERVER`,
+   `WEB_AUTH_ENDPOINT`).
+3. Add a structured entry to `contracts/anchors.json` with those fields and a
+   `$comment` noting where the data came from and when it was checked.
+4. Run `pnpm test` — the validation test rejects malformed or duplicate entries.
+5. Open a PR. A human reviews the diff; nothing writes the file automatically.
+
 ## 1. Capturing the testnet end-to-end run
 
 Endpoints of one production anchor were probed live, and the full money-moving

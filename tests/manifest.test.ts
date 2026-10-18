@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { liveness, parseCorridor, LIVENESS_LABEL } from "@corridor/manifest";
+import {
+  liveness,
+  parseCorridor,
+  LIVENESS_LABEL,
+  hashCorridor,
+  manifestHash,
+  canonicalJson,
+} from "@corridor/manifest";
 
 const valid = {
   id: "t",
@@ -527,6 +534,80 @@ describe("limits", () => {
       });
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error.message).toContain("custom:<name>");
+    });
+  });
+
+  describe("hashCorridor", () => {
+    it("computes a stable 64-hex SHA-256 hash of a validated corridor", () => {
+      const parsed = parseCorridor(valid);
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) return;
+
+      const hash1 = hashCorridor(parsed.value);
+      const hash2 = manifestHash(parsed.value);
+      expect(hash1).toMatch(/^[0-9a-f]{64}$/);
+      expect(hash1).toBe(hash2);
+    });
+
+    it("produces identical hashes regardless of object key order (canonical JSON)", () => {
+      const objA = { b: 2, a: 1, nested: { y: "hello", x: "world" } };
+      const objB = { a: 1, b: 2, nested: { x: "world", y: "hello" } };
+      expect(canonicalJson(objA)).toBe(canonicalJson(objB));
+      expect(canonicalJson(objA)).toBe('{"a":1,"b":2,"nested":{"x":"world","y":"hello"}}');
+    });
+
+    it("produces different hashes when manifest fields change", () => {
+      const base = parseCorridor(valid);
+      expect(base.ok).toBe(true);
+      if (!base.ok) return;
+
+      const baseHash = hashCorridor(base.value);
+
+      // Change asset_issuer
+      const changedIssuer = parseCorridor({
+        ...valid,
+        settlement: { ...valid.settlement, asset_issuer: "GDIFFERENTISSUER" },
+      });
+      expect(changedIssuer.ok).toBe(true);
+      if (changedIssuer.ok) {
+        expect(hashCorridor(changedIssuer.value)).not.toBe(baseHash);
+      }
+
+      // Change limits
+      const changedLimits = parseCorridor({
+        ...valid,
+        limits: { min_amount: "10", max_amount: "500" },
+      });
+      expect(changedLimits.ok).toBe(true);
+      if (changedLimits.ok) {
+        expect(hashCorridor(changedLimits.value)).not.toBe(baseHash);
+      }
+
+      // Change recovery policy
+      const changedRecovery = parseCorridor({
+        ...valid,
+        recovery: { max_retries: 5, rollback: "hold" },
+      });
+      expect(changedRecovery.ok).toBe(true);
+      if (changedRecovery.ok) {
+        expect(hashCorridor(changedRecovery.value)).not.toBe(baseHash);
+      }
+
+      // Change anchor endpoint
+      const changedEndpoint = parseCorridor({
+        ...valid,
+        dest: {
+          ...valid.dest,
+          endpoints: {
+            ...valid.dest.endpoints,
+            transfer_server_sep31: "https://d.example/v2/sep31",
+          },
+        },
+      });
+      expect(changedEndpoint.ok).toBe(true);
+      if (changedEndpoint.ok) {
+        expect(hashCorridor(changedEndpoint.value)).not.toBe(baseHash);
+      }
     });
   });
 });
