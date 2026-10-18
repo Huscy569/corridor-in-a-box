@@ -58,10 +58,8 @@ export {
   RegistryRouteResolver,
   UnattestedAnchorError,
   isUnattestedDomainAllowed,
-} from "./registry-resolver";
-export type {
-  AttestationSource,
-  RegistryResolverOptions,
+  type AttestationSource,
+  type RegistryResolverOptions,
 } from "./registry-resolver";
 
 export { createAdapterRegistry } from "./adapters";

@@ -6,10 +6,7 @@
     "node": ">=22"
   },
   "exports": {
-    ".": "./src/index.ts",
-    "./adapters": "./src/adapters.ts",
-    "./registry-resolver": "./src/registry-resolver.ts",
-    "./adapters-registry": "./src/adapters.ts"
+    ".": "./src/index.ts"
   },
   "main": "./src/index.ts",
   "dependencies": {
