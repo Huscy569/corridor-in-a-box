@@ -7,11 +7,123 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ## [Unreleased]
 
+### Added — Zeam (South Africa) probed and added as the second VERIFIED lane ([#225](https://github.com/ezedike-evan/corridor-in-a-box/issues/225))
+
+`corridors/zeam.corridor.yaml` — USD → ZAR over `mint.zeam.money`, probed
+2026-10-17 with `@corridor/probe`: SEP-10 signed a challenge and got a JWT,
+SEP-38 returned a firm quote, SEP-12 answered, and SEP-31 `/info` receives USDC
+(toml sha256 `92a309791b0eefff…`). Unlike Cowrie, Zeam publishes
+`ANCHOR_QUOTE_SERVER`, so this lane keeps `fx.quote_source: sep38`.
+`contracts/anchors.json` now probes the domain on the scheduled attester job.
+
+The payout currency is ZAR, not the KES the issue assumed: Zeam's toml anchors
+`ZARZ` (fiat ZAR) and `GBPZ`, and its Anchor Directory entry lists the
+Democratic Republic of the Congo, Malawi, South Africa, Zambia and Zimbabwe.
+
+### Added — `@corridor/sep6`: a SEP-6 withdrawal adapter on the same port ([#197](https://github.com/ezedike-evan/corridor-in-a-box/issues/197))
+
+`packages/sep6` implements `AnchorAdapter` for a `dest.protocol: sep6` corridor,
+so the engine's `quote → comply → open → settle → reconcile` run needs no
+changes to drive a SEP-6 anchor: `openTransaction` returns `stellar_payment`
+`instructions` (the anchor's `withdraw_anchor_account` and memo), and the
+on-chain leg still goes through `StellarPaymentStrategy`. The `/info` discovery
+(`info()`, `parseSep6Info`) from the scaffold is kept; before `info()` has run
+`capabilities().settlement` is `["stellar_payment"]`, and it becomes empty if
+`/info` omits or disables the dest asset.
+
+- `GET {transfer_server}/withdraw-exchange` with query params, per SEP-6
+  v4.3.0. The issue text named `POST /transactions/withdraw-exchange`, a path no
+  version of the spec defines; verified live against
+  `testanchor.stellar.org` (`TRANSFER_SERVER = https://testanchor.stellar.org/sep6`),
+  where GET returns 200 `{"id": …}` and POST returns "Request method 'POST' is
+  not supported".
+- Because that response carries no account, `openTransaction` follows up with
+  exactly one authenticated `GET /transaction?id=` and reads
+  `withdraw_anchor_account` / `withdraw_memo` / `withdraw_memo_type`. If the
+  anchor still names no account the adapter refuses instead of returning an
+  empty address — non-retryable on purpose, since SEP-6 has no idempotent
+  re-open and an automatic retry would initiate a second withdrawal.
+- The KYC-shaped answers are refusals, not instructions:
+  `non_interactive_customer_info_needed` → `KYC_REQUIRED` listing the fields,
+  `customer_info_status` denied → `KYC_REJECTED`, pending/unknown →
+  `KYC_REQUIRED`. Matched on the body's `type` before the status code.
+- `SEP-10` auth is fail-closed and cached like `@corridor/sep31`, and
+  `mapSep6Status` keeps the fail-open-to-polling discipline while adding
+  `pending_user_transfer_start`/`_complete`, `pending_user`, `pending_trust`,
+  `on_hold` and the `no_market`/`too_small`/`too_large` terminals.
+- Deliberate floors, each naming the issue that owns the design: `requestQuote`
+  is minimal and refuses without a `quote_server` (#196), `ensureCompliance`
+  refuses without a `kyc_server` rather than assuming a KYC-less lane (#193),
+  and `requestRefund` returns `REFUND_UNSUPPORTED` without a network call, as
+  SEP-6 defines no sender-initiated refund.
+
+### Added — chaos suite: no money moves unless the gate passed ([#300](https://github.com/ezedike-evan/corridor-in-a-box/issues/300))
+
+`tests/chaos.test.ts` injects one failure at a time into every step — route
+resolution, the four adapter verbs, all seven pre-settle gate checks,
+`gate.evaluate`, settle, reconcile — across `throw` / `retryable` /
+`non_retryable` / `timeout`, sweeping the three rollback policies where recovery
+differs. Per cell it asserts `submit()` was never reached when a step before
+settle failed, that money moved at most once and only after the last gate
+evaluation fully passed, and that the persisted state matches the runbook's
+terminal set. Four crash-and-resume cases cover the idempotency conflicts and
+prove a resume never re-settles. A fake clock drives every timeout, so the suite
+adds no real waiting.
+
+Two tests record a documented discrepancy rather than papering over it: a throw
+from an adapter verb or from `submit()` is not caught by `run.ts`, so `execute()`
+rejects and the stored row stays non-terminal — only gate throws are fail-closed.
+
+### Fixed — dashboard accessibility pass (#295)
+
+- `/payments`: every label is associated with its control (`useId`), the refused-amount error is tied to the field with `aria-invalid` and `aria-describedby` and focus moves to it, and each step of the state machine carries its status as text, not only colour or opacity.
+- The outcome of a run is announced through a `role="status"` live region (one note while it runs, the result once known).
+- Decorative icons are hidden from assistive technology or paired with text; headings, `nav` landmarks, `aria-current` and the theme toggle's pressed state are added; link text that repeats ("Run a payment") says which corridor.
+- A visible focus indicator, scroll padding under the sticky header, and text colours that keep 4.5:1 contrast in both themes.
+- The wording lives in `web/lib/run-status.ts` and is covered by `tests/web-run-status.test.ts`.
+
+### Added
+
+- Engine dry-run mode (#298). `execute(intent, corridor, deps, { dryRun: true })` runs quote, comply, open and the pre-settle gate against the real anchor, then stops before `settling` without calling `SettlementSubmitter.submit()` or `findExisting()`. A run that passes the gate is persisted as `failed` with the new `DRY_RUN_COMPLETE` code. Its gate results go on the audit trail and in the error's `cause` (`DryRunReport`). The code is breaker-neutral and maps to HTTP 409. Exposed as `corridor canary --dry-run` (exit `0`; rejected with `--write`) and `--dry-run` on `pnpm example` / `pnpm testnet`. The opened SEP-31 transaction is never funded and expires on the anchor's side.
+- Dashboard freshness (#296). `fetchAttestations()` returns `readAt` and the RPC's `latestLedger`. The Attested anchors section shows "Read from <network> registry at <time> · ledger N · <age> ago · refreshes every 1 hour", with the age worked out in the browser and a warning style once it passes the revalidate window. Per-anchor staleness shows an approximate duration (~5 s/ledger) next to the ledger count.
+- `mykobo.co` joins the attester anchor list in `contracts/anchors.json`. Its `stellar.toml` advertises SEP-6, SEP-24 and SEP-31, but the host it publishes for those APIs (`stellar.mykobo.co`) does not resolve, so the SEP-10 and SEP-31 probes fail and no corridor manifest is written. The probe outcome is recorded in the file's `$comment` (#226).
+
+### Added — QuoteProvider abstraction: SEP-38, adapter-native, and external pricing (#189)
+
+- Introduces `Sep38QuoteProvider` and `AdapterQuoteProvider` implementing `QuoteProvider`.
+- Refactors `Sep31Adapter.requestQuote` to delegate to `Sep38QuoteProvider`.
+- Extends corridor manifest `fx.quote_source` enum with `"native"`.
+- Adds `EngineDeps.quoteProvider` allowing operators to inject custom quote providers or factories `(corridor, adapter) => QuoteProvider`.
+- Engine validates adapter capabilities when `quote_source: "native"` is configured and dispatches quoting to `AdapterQuoteProvider`.
+
+### Added — Engine: read adapter capabilities instead of assuming SEP-31 behaviour (#188)
+
+- Engine executes `checkCompatibility(corridor, caps, strategies)` before external adapter calls.
+- Adds `CAPABILITY_MISMATCH` to `CorridorErrorCode` (mapped to HTTP 422 in service layer and documented in API docs).
+- Fails execution with `CAPABILITY_MISMATCH` if corridor requires quotes (e.g. `sep38`) but adapter capabilities report `quotes: ["none"]`, or if adapter settlement capabilities are empty or have unsupported settlement kinds not covered by available settlement strategies.
+- Skips compliance / KYC step during execution and resume when adapter capabilities declare `kyc: "none"`.
+
+### Added — `OpenTransaction.instructions` discriminated union (#183)
+
+- Add `DepositInstructions` discriminated union (`stellar_payment`, `claimable_balance`, `adapter_settled`) to `@corridor/adapter-kit`.
+- Update `OpenTransaction` to carry `instructions: DepositInstructions` while retaining deprecated optional `depositAddress`, `memo`, and `memoType` fields and adding `toLegacy()` helper for single-release backward compatibility.
+- Update `Sep31Adapter` and `createMockAdapter` to return `instructions` with `kind: "stellar_payment"`.
+- Update `settle()` in `@corridor/engine` to switch on `instructions.kind` and fail closed (`SETTLEMENT_FAILED`, non-retryable) on unhandled instruction kinds before attempting payment submission.
+
 ### Added — `--json` flag to `pnpm probe:anchor` (#232)
 
 - Adds `--json` flag parsing to `examples/probe-anchor.ts` accepted in any argv position.
 - Suppresses banner and human logs when `--json` is supplied, streaming only the serialized JSON probe result to stdout.
 - Introduces `formatProbeResultJson` and `parseProbeArgs` in `@corridor/probe`, formatting raw bitmasks alongside decoded SEP numbers and executed/passed probe lists.
+
+### Added: SEP-6 adapter scaffold with GET /info discovery
+
+`@corridor/sep6` implements the receiving-side `AnchorAdapter` for SEP-6
+anchors. It parses `GET {transfer_server}/info` (the `withdraw` and
+`withdraw-exchange` sections), caches the result on the adapter instance, and
+derives `capabilities()` from it. The transfer verbs fail closed with
+`ANCHOR_UNAVAILABLE` until their issues land (#196, #197, #198). SEP-10 auth is
+deliberately not wired here; it waits on the shared client from #194.
 
 ### Fixed — a resumed recovery run reports its real cause to the circuit breaker
 

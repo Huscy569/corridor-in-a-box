@@ -9,12 +9,17 @@
 import type { Corridor } from "@corridor/manifest";
 import {
   applyPrice,
+  compareAmounts,
   fail,
+  isValidAmount,
   ok,
+  subAmounts,
   type Money,
   type Outcome,
   type PaymentIntent,
 } from "@corridor/types";
+
+export { Sep10Client, jwtExpiryMs, type Sep10Signer } from "./sep10";
 
 /** A SEP-38 quote. `firm` quotes carry an id + expiry and bind the deliverer to a rate. */
 export interface Quote {
@@ -34,17 +39,69 @@ export interface KycResult {
   readonly customerId?: string;
 }
 
+/**
+ * Deposit instructions returned by an anchor describing where or how to settle funds.
+ * Discriminated union supporting on-chain Stellar payments, claimable balance funding,
+ * and off-chain / adapter-settled transactions (#183).
+ */
+export type DepositInstructions =
+  | {
+      readonly kind: "stellar_payment";
+      readonly to: string;
+      readonly memo?: string;
+      readonly memoType?: "text" | "hash" | "id";
+      readonly asset?: string;
+    }
+  | {
+      readonly kind: "claimable_balance";
+      readonly claimant: string;
+      readonly asset?: string;
+      readonly predicateSeconds?: number;
+    }
+  | {
+      readonly kind: "adapter_settled";
+      readonly reference?: string;
+    };
+
+/**
+ * Extract legacy flat address and memo fields from an OpenTransaction.
+ * Retained for backward compatibility during transition to instructions union.
+ */
+export function toLegacy(tx: OpenTransaction): {
+  readonly depositAddress?: string;
+  readonly memo?: string;
+  readonly memoType?: "text" | "hash" | "id";
+} {
+  if (tx.instructions && tx.instructions.kind === "stellar_payment") {
+    return {
+      depositAddress: tx.instructions.to,
+      memo: tx.instructions.memo,
+      memoType: tx.instructions.memoType,
+    };
+  }
+  return {
+    depositAddress: tx.depositAddress,
+    memo: tx.memo,
+    memoType: tx.memoType,
+  };
+}
+
 /** Returned by the receiving anchor's SEP-31 POST /transactions — where to send the bridge asset. */
 export interface OpenTransaction {
   readonly transactionId: string;
-  readonly depositAddress: string;
+  readonly instructions: DepositInstructions;
+  readonly amountIn?: Money;
+  /**
+   * @deprecated Read from `instructions` instead. Retained for single-release compatibility.
+   */
+  readonly depositAddress?: string;
+  /**
+   * @deprecated Read from `instructions` instead. Retained for single-release compatibility.
+   */
   readonly memo?: string;
   /**
-   * How to encode `memo` on the settlement transaction. SEP-31 anchors return
-   * this alongside the memo and it is NOT always "text" — the Anchor Platform
-   * reference server issues base64 `hash` memos, which are 32 bytes and blow
-   * past the 28-byte text limit if encoded as text. Defaults to "text" only when
-   * the anchor says nothing.
+   * How to encode `memo` on the settlement transaction.
+   * @deprecated Read from `instructions` instead. Retained for single-release compatibility.
    */
   readonly memoType?: "text" | "hash" | "id";
 }
@@ -93,6 +150,77 @@ export interface RefundInfo {
    * string equality: "100" and "100.00" are the same amount of money.
    */
   readonly completeness: "full" | "partial" | "unknown";
+}
+
+/** The `refunds` object as SEP-6 / SEP-31 puts it on the wire — every field untrusted. */
+export interface RawRefunds {
+  amount_refunded?: unknown;
+  amount_fee?: unknown;
+  payments?: unknown;
+}
+
+/**
+ * Parse SEP-6 / SEP-31's `refunds` object off a transaction record.
+ *
+ * Everything is optional and untrusted: anchors omit `refunds` entirely on the
+ * happy path, amounts arrive as strings, and a malformed field must never turn
+ * a poll into an error — the status classification is what the engine acts on
+ * and it is decided independently of this.
+ *
+ * Returns undefined rather than a zero-filled object when the refund cannot be
+ * read: "refunded nothing" and "said nothing" are different facts, and the
+ * engine must not be able to confuse them.
+ *
+ * @param settledAmount the amount that went out (`amount_in`), used to tell a
+ * partial refund from a full one. Compared with `compareAmounts` — "100" and
+ * "100.00" are the same amount of money and string equality says otherwise.
+ */
+export function parseRefunds(
+  refunds: unknown,
+  asset: string,
+  settledAmount?: string,
+): RefundInfo | undefined {
+  if (!refunds || typeof refunds !== "object" || Array.isArray(refunds)) return undefined;
+  const raw = refunds as RawRefunds;
+
+  const parseAmt = (v: unknown): string | undefined => {
+    return typeof v === "string" && isValidAmount(v.trim()) ? v.trim() : undefined;
+  };
+
+  const amountRefunded = parseAmt(raw.amount_refunded);
+  if (amountRefunded === undefined) return undefined;
+
+  const amountFee = parseAmt(raw.amount_fee) ?? "0";
+
+  const payments: RefundPayment[] = [];
+  if (Array.isArray(raw.payments)) {
+    for (const entry of raw.payments) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const p = entry as { id?: unknown; id_type?: unknown; amount?: unknown; fee?: unknown };
+      const amount = parseAmt(p.amount);
+      if (typeof p.id !== "string" || !p.id || amount === undefined) continue;
+      payments.push({
+        id: p.id,
+        ...(typeof p.id_type === "string" && p.id_type ? { idType: p.id_type } : {}),
+        amount: { asset, amount },
+        fee: { asset, amount: parseAmt(p.fee) ?? "0" },
+      });
+    }
+  }
+
+  const settled = settledAmount !== undefined ? parseAmt(settledAmount) : undefined;
+  let completeness: RefundInfo["completeness"] = "unknown";
+  if (settled !== undefined) {
+    const cmp = compareAmounts(amountRefunded, settled);
+    if (cmp.ok) completeness = cmp.value < 0 ? "partial" : "full";
+  }
+
+  return {
+    amountRefunded: { asset, amount: amountRefunded },
+    amountFee: { asset, amount: amountFee },
+    payments,
+    completeness,
+  };
 }
 
 export interface TransactionStatus {
@@ -163,27 +291,219 @@ export interface RefundRef {
 }
 
 /**
- * SHIM for #187 (minimal, to be reconciled with that issue's PR).
  * What an adapter supports, discoverable up front instead of by failing.
- * `settlement` is `readonly string[]` here because `DepositInstructions` (the
- * type #187 names) does not exist in this tree yet.
+ * Exposes supported quote styles, KYC mechanism, settlement kinds, refunds and callbacks.
  */
 export interface AdapterCapabilities {
   readonly protocol: string;
   readonly quotes: readonly ("sep38_firm" | "sep38_indicative" | "native" | "none")[];
   readonly kyc: "sep12" | "sep6_fields" | "bespoke" | "none";
-  readonly settlement: readonly string[];
+  readonly settlement: readonly DepositInstructions["kind"][];
   readonly refunds: "request" | "report_only" | "none";
   readonly callbacks: boolean;
 }
 
 /**
- * SHIM for #189 (interface only, to be reconciled with that issue's PR).
  * A source of quotes, independent of the receiving adapter.
  */
 export interface QuoteProvider {
   readonly source: "sep38" | "native" | "external";
   quote(intent: PaymentIntent, corridor: Corridor): Promise<Outcome<Quote>>;
+}
+
+/**
+ * Convert the corridor's bridge asset into the SEP-38 Asset Identification Format:
+ * `stellar:native` for XLM, `stellar:CODE:ISSUER` for everything else. Anchors
+ * reject issuer-less Stellar asset ids ("sell_asset not found").
+ */
+export function sep38SellAsset(corridor: Corridor): string {
+  const code = corridor.settlement.bridge_asset;
+  return code.toUpperCase() === "XLM"
+    ? "stellar:native"
+    : `stellar:${code}:${corridor.settlement.asset_issuer}`;
+}
+
+export const QUOTE_TOLERANCE = "0.001";
+
+export interface Sep38QuoteProviderOptions {
+  /**
+   * The protocol context passed in SEP-38 POST /quote `context` field (e.g. "sep31", "sep6").
+   * Defaults to "sep31".
+   */
+  readonly context?: string;
+  /**
+   * Optional custom fetch implementation (e.g. for mock testing).
+   */
+  readonly fetchImpl?: typeof fetch;
+  /**
+   * Optional name used in error messages (defaults to destination anchor name or "SEP-38").
+   */
+  readonly name?: string;
+  /**
+   * Explicit quote server URL or resolver function.
+   * If omitted, falls back to `corridor.dest.endpoints.quote_server`.
+   */
+  readonly quoteServer?: string | ((corridor: Corridor) => string | undefined);
+  /**
+   * Supplier for bearer auth token (e.g. from SEP-10).
+   */
+  readonly authToken?: (corridor: Corridor) => Promise<Outcome<string | undefined>>;
+}
+
+/**
+ * SEP-38 `total_price` is sell units per buy unit INCLUDING fees, so
+ * `total_price x buy_amount` must land on `sell_amount` (within `QUOTE_TOLERANCE`).
+ * Returns a description of the inconsistency, or undefined when the numbers agree or
+ * the anchor did not send a usable `total_price`. Shared by every adapter that reads a
+ * firm SEP-38 quote (SEP-31, SEP-6), so they cannot drift apart.
+ */
+export function totalPriceProblem(q: {
+  quoteId: string;
+  totalPrice: string | undefined;
+  buyAmount: string;
+  sellAmount: string;
+}): string | undefined {
+  const { quoteId, totalPrice, buyAmount, sellAmount } = q;
+  if (!totalPrice || !isValidAmount(totalPrice) || !isValidAmount(buyAmount)) return undefined;
+  const impliedSell = applyPrice(buyAmount, totalPrice);
+  if (!impliedSell.ok) return undefined;
+  const drift = subAmounts(impliedSell.value, sellAmount);
+  const tolerance = applyPrice(sellAmount, QUOTE_TOLERANCE);
+  if (!drift.ok || !tolerance.ok) return undefined;
+  const abs = drift.value.startsWith("-") ? drift.value.slice(1) : drift.value;
+  const within = compareAmounts(abs, tolerance.value);
+  if (!within.ok || within.value <= 0) return undefined;
+  return (
+    `quote ${quoteId} is internally inconsistent — ` +
+    `total_price ${totalPrice} × buy_amount ${buyAmount} = ` +
+    `${impliedSell.value}, but sell_amount is ${sellAmount}`
+  );
+}
+
+/**
+ * Quote provider for `fx.quote_source: sep38`. Interacts with an anchor's SEP-38
+ * quote server to obtain firm conversion rates with fees and expiration.
+ */
+export class Sep38QuoteProvider implements QuoteProvider {
+  readonly source = "sep38" as const;
+
+  constructor(private readonly opts: Sep38QuoteProviderOptions = {}) {}
+
+  async quote(intent: PaymentIntent, corridor: Corridor): Promise<Outcome<Quote>> {
+    const name = this.opts.name ?? corridor.dest.name ?? "SEP-38";
+    const endpoints = corridor.dest.endpoints as Record<string, unknown>;
+    const server =
+      typeof this.opts.quoteServer === "function"
+        ? this.opts.quoteServer(corridor)
+        : (this.opts.quoteServer ??
+          (typeof endpoints.quote_server === "string" ? endpoints.quote_server : undefined));
+    if (!server) {
+      return fail("QUOTE_UNAVAILABLE", `${name}: anchor exposes no SEP-38 quote server`);
+    }
+
+    let authHeader: Record<string, string> = {};
+    if (this.opts.authToken) {
+      const auth = await this.opts.authToken(corridor);
+      if (!auth.ok) return auth;
+      if (auth.value) {
+        authHeader = { authorization: `Bearer ${auth.value}` };
+      }
+    }
+
+    try {
+      const fetchImpl = this.opts.fetchImpl ?? fetch;
+      const context = this.opts.context ?? "sep31";
+      const sellAsset = sep38SellAsset(corridor);
+      const buyAsset = corridor.dest.asset;
+
+      const res = await fetchImpl(`${server}/quote`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...authHeader,
+        },
+        body: JSON.stringify({
+          context,
+          sell_asset: sellAsset,
+          buy_asset: buyAsset,
+          sell_amount: intent.sourceAmount.amount,
+        }),
+      });
+
+      if (!res.ok) {
+        return fail("QUOTE_UNAVAILABLE", `${name}: quote HTTP ${res.status}`, {
+          retryable: res.status >= 500,
+        });
+      }
+
+      const j = (await res.json()) as {
+        id: string;
+        price: string;
+        total_price?: string;
+        expires_at: string;
+        sell_amount: string;
+        buy_amount: string;
+        fee?: { total: string; asset: string };
+      };
+
+      const sellAmount = j.sell_amount ?? intent.sourceAmount.amount;
+      if (!isValidAmount(sellAmount)) {
+        return fail(
+          "QUOTE_UNAVAILABLE",
+          `${name}: quote sell_amount "${sellAmount}" is malformed`,
+        );
+      }
+
+      const inconsistent = totalPriceProblem({
+        quoteId: j.id,
+        totalPrice: j.total_price,
+        buyAmount: j.buy_amount,
+        sellAmount,
+      });
+      if (inconsistent) return fail("QUOTE_UNAVAILABLE", `${name}: ${inconsistent}`);
+
+      let fee: Money | undefined;
+      if (j.fee) {
+        if (j.fee.asset !== sellAsset) {
+          return fail(
+            "QUOTE_UNAVAILABLE",
+            `${name}: quote fee asset "${j.fee.asset}" does not match sell asset "${sellAsset}"`,
+          );
+        }
+        if (isValidAmount(j.fee.total)) {
+          fee = { asset: intent.sourceAmount.asset, amount: j.fee.total };
+        }
+      }
+
+      return ok<Quote>({
+        id: j.id,
+        price: j.price,
+        expiresAt: Date.parse(j.expires_at),
+        sourceAmount: { asset: intent.sourceAmount.asset, amount: sellAmount },
+        destAmount: { asset: buyAsset, amount: j.buy_amount },
+        ...(fee && { fee }),
+        firm: true,
+      });
+    } catch (cause) {
+      return fail("ANCHOR_UNAVAILABLE", `${name}: quote request failed`, {
+        retryable: true,
+        cause,
+      });
+    }
+  }
+}
+
+/**
+ * Wraps an adapter's native quote handling into the `QuoteProvider` interface.
+ */
+export class AdapterQuoteProvider implements QuoteProvider {
+  readonly source = "native" as const;
+
+  constructor(private readonly adapter: AnchorAdapter) {}
+
+  async quote(intent: PaymentIntent, corridor: Corridor): Promise<Outcome<Quote>> {
+    return this.adapter.requestQuote(intent, corridor);
+  }
 }
 
 /** What the operator's pricing feed returns for an external quote. */
@@ -384,10 +704,17 @@ export function createMockAdapter(opts: MockAdapterOptions = {}): AnchorAdapter 
       return ok<KycResult>({ status: opts.kyc ?? "accepted", customerId: "cust_mock" });
     },
     async openTransaction(_intent, quote) {
+      const instructions: DepositInstructions = {
+        kind: "stellar_payment",
+        to: "GMOCK000000000000000000000000000000000000000000000000",
+        memo: "mock-memo",
+      };
       const tx: OpenTransaction = {
         transactionId: `tx_${++counter}`,
-        depositAddress: "GMOCK000000000000000000000000000000000000000000000000",
-        memo: "mock-memo",
+        instructions,
+        amountIn: quote.sourceAmount,
+        depositAddress: instructions.to,
+        memo: instructions.memo,
       };
       opened.set(tx.transactionId, {
         amountIn: quote.sourceAmount,
@@ -428,3 +755,5 @@ export function createMockAdapter(opts: MockAdapterOptions = {}): AnchorAdapter 
     },
   };
 }
+
+export * from "./conformance";

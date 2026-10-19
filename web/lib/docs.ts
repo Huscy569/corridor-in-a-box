@@ -84,6 +84,7 @@ packages/
   manifest/      Zod schema for a corridor + loader
   adapter-kit/   AnchorAdapter port + conformance probes + mock adapter
   sep31/         ONE generic adapter (SEP-10 auth + SEP-12 KYC)
+  sep6/          ONE generic adapter (GET /info discovery + capabilities)
   stellar/       the only money-path package that touches the chain:
                  settlement submitter + SEP-10 signer
   router/        RouteResolver seam — open interface + static default
@@ -175,8 +176,11 @@ Body is a \`PaymentIntent\`:
 | \`409\` | \`IDEMPOTENCY_CONFLICT\` | Replay with conflicting parameters or in-flight payment with same key |
 | \`409\` | \`QUOTE_EXPIRED\` | Anchor quote expired before settlement could begin |
 | \`409\` | \`KYC_REQUIRED\` | Customer KYC incomplete or customer action required |
+| \`409\` | \`MANIFEST_CHANGED\` | Corridor manifest changed since the run started; resume refused before settle |
+| \`409\` | \`DRY_RUN_COMPLETE\` | A \`dryRun: true\` run passed the pre-settle gate and stopped before settling; nothing was sent. The HTTP API never starts dry runs, so this code only appears from the engine or CLI |
 | \`413\` | \`payload too large\` | Request body exceeds \`maxBodyBytes\` cap (default 64 KiB) |
 | \`422\` | \`AMOUNT_INVALID\` | Amount is not a positive decimal or cannot be settled |
+| \`422\` | \`CAPABILITY_MISMATCH\` | Adapter capabilities do not match corridor manifest or settlement strategies |
 | \`422\` | \`MANIFEST_INVALID\` | Corridor manifest validation failed |
 | \`429\` | \`rate_limited\` | Token-bucket rate limit exceeded for client IP or API key |
 | \`500\` | \`SETTLEMENT_FAILED\` | On-chain Stellar payment transaction failed |
@@ -239,7 +243,7 @@ across two anchors_ and move the on-chain bridge asset between them. They are
 complementary — in a real lane the receiving anchor runs the Anchor Platform and
 this engine talks to it.
 
-| | Anchor Platform | corridor-in-a-box |
+| Aspect | Anchor Platform | corridor-in-a-box |
 |---|---|---|
 | Who runs it | An anchor | A remittance operator / PSP |
 | Role | Serve SEP endpoints | Orchestrate a payment end-to-end |

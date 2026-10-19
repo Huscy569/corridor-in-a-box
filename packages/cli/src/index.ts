@@ -5,7 +5,7 @@
 //
 //   corridor validate <file.corridor.yaml>
 //   corridor plan     <file.corridor.yaml>
-//   corridor canary   <file.corridor.yaml> --amount <amount> [--network <public|testnet>]
+//   corridor canary   <file.corridor.yaml> --amount <amount> [--network <public|testnet>] [--dry-run]
 //   corridor breaker  status [corridorId]
 //   corridor breaker  reset <corridorId> --reason "…"
 //
@@ -15,6 +15,7 @@
 //
 // `canary` drives one tiny real payment through the full, gated stack:
 // Sep31Adapter + StellarSettlementSubmitter + the default gate + RegistryRouteResolver.
+// With --dry-run it stops after the pre-settle gate and never submits a payment.
 //
 // `breaker` is the other end: when a lane has halted itself, someone has to look
 // at why and then say so in writing before it will take money again. See
@@ -23,6 +24,7 @@
 import { liveness, loadCorridor, type Corridor } from "@corridor/manifest";
 import { isSettleableAmount } from "@corridor/types";
 import { PostgresIdempotencyStore, migrate, type CorridorHealthStore } from "@corridor/engine";
+import { newCommand } from "./new.js";
 import {
   RESOLVE_USAGE,
   listHeldRuns,
@@ -43,11 +45,13 @@ import {
   parseBreakerArgs,
   type BreakerCommand,
 } from "./breaker";
+import { formatLintResult, lintCorridor } from "./lint";
 
 /** The first line is the main usage text; the breaker help follows it. */
 const USAGE = [
-  "usage: corridor <validate|plan|canary> <file.corridor.yaml> [options] | runs list --state held | resolve <key> --outcome <outcome> --note <text>",
+  "usage: corridor <validate|plan|lint|canary|new> <file.corridor.yaml|domain> [options] | runs list --state held | resolve <key> --outcome <outcome> --note <text>",
   '       corridor breaker <status [corridorId] | reset <corridorId> --reason "…">',
+  "       corridor new <domain> [--source-asset <asset>] [--network <public|testnet>] [--out <file>] [--allow-not-runnable]",
   "",
   "corridor breaker — inspect and reopen halted lanes (reads DATABASE_URL):",
   BREAKER_USAGE,
@@ -66,7 +70,8 @@ async function main(argv: string[]): Promise<number> {
   }
   if (cmd === "resolve") return resolveCommand(argv.slice(1));
   if (cmd === "breaker") return breakerCommand(argv.slice(1));
-  if (!cmd || (cmd !== "validate" && cmd !== "plan" && cmd !== "canary")) {
+  if (cmd === "new") return newCommand(argv.slice(1));
+  if (!cmd || (cmd !== "validate" && cmd !== "plan" && cmd !== "lint" && cmd !== "canary")) {
     console.error(USAGE);
     return EXIT_USAGE;
   }
@@ -77,6 +82,7 @@ async function main(argv: string[]): Promise<number> {
     let network: string | undefined;
     let skipDoctor = false;
     let write = false;
+    let dryRun = false;
 
     const rest = argv.slice(1);
     for (let i = 0; i < rest.length; i++) {
@@ -101,6 +107,8 @@ async function main(argv: string[]): Promise<number> {
         skipDoctor = true;
       } else if (arg === "--write") {
         write = true;
+      } else if (arg === "--dry-run") {
+        dryRun = true;
       } else if (arg.startsWith("--")) {
         console.error(`error: unknown option "${arg}"`);
         return 2;
@@ -116,8 +124,13 @@ async function main(argv: string[]): Promise<number> {
 
     if (!file) {
       console.error(
-        "usage: corridor canary <file.corridor.yaml> --amount <amount> [--network <public|testnet>] [--write]",
+        "usage: corridor canary <file.corridor.yaml> --amount <amount> [--network <public|testnet>] [--write | --dry-run]",
       );
+      return 2;
+    }
+
+    if (dryRun && write) {
+      console.error("error: --write records a completed payment; a --dry-run makes none");
       return 2;
     }
 
@@ -146,6 +159,7 @@ async function main(argv: string[]): Promise<number> {
       amount,
       network,
       skipDoctor,
+      dryRun,
     });
     if (runResult.exitCode !== 0 || !runResult.run || !runResult.settlement) {
       return runResult.exitCode;
@@ -189,6 +203,24 @@ async function main(argv: string[]): Promise<number> {
   if (cmd === "validate") {
     console.log(`✓ ${file} is a valid corridor manifest (id="${c.id}")`);
     return EXIT_OK;
+  }
+
+  if (cmd === "lint") {
+    try {
+      const result = await lintCorridor(c);
+      const output = formatLintResult(result);
+      if (result.ok) {
+        console.log(output);
+        return EXIT_OK;
+      }
+      console.error(output);
+      return EXIT_FAILED;
+    } catch (e) {
+      console.error(
+        `✗ ${c.id} (${c.dest.endpoints.home_domain}): ${e instanceof Error ? e.message : String(e)}`,
+      );
+      return EXIT_FAILED;
+    }
   }
 
   printPlan(c);

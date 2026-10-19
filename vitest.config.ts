@@ -8,8 +8,10 @@ export default defineConfig({
     alias: {
       "@corridor/types": r("./packages/types/src/index.ts"),
       "@corridor/manifest": r("./packages/manifest/src/index.ts"),
+      "@corridor/probe": r("./packages/probe/src/index.ts"),
       "@corridor/adapter-kit": r("./packages/adapter-kit/src/index.ts"),
       "@corridor/sep31": r("./packages/sep31/src/index.ts"),
+      "@corridor/sep6": r("./packages/sep6/src/index.ts"),
       "@corridor/router": r("./packages/router/src/index.ts"),
       "@corridor/engine": r("./packages/engine/src/index.ts"),
       "@corridor/stellar": r("./packages/stellar/src/index.ts"),

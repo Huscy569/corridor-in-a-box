@@ -762,6 +762,12 @@ describe("openedTxCheck gate check (anchor.tx.match)", () => {
       },
       opened: {
         transactionId: "tx-1",
+        instructions: {
+          kind: "stellar_payment",
+          to: DEST,
+          memo: "memo-abc-123",
+          memoType: "text",
+        },
         depositAddress: DEST,
         memo: "memo-abc-123",
         memoType: "text",
@@ -994,6 +1000,12 @@ describe("sep31InfoCheck gate check (sep31.info.asset)", () => {
       },
       opened: {
         transactionId: "tx-1",
+        instructions: {
+          kind: "stellar_payment",
+          to: "GDEPOSIT",
+          memo: "memo123",
+          memoType: "text",
+        },
         depositAddress: "GDEPOSIT",
         memo: "memo123",
         memoType: "text",
@@ -1117,6 +1129,7 @@ describe("receiverKycCheck gate check (sep12.receiver)", () => {
       },
       opened: {
         transactionId: "tx-1",
+        instructions: { kind: "stellar_payment", to: "GDEPOSIT" },
         depositAddress: "GDEPOSIT",
       },
       now: Date.now(),
@@ -1330,6 +1343,7 @@ describe("amountRangeCheck gate check (sep31.amount.range)", () => {
       },
       opened: {
         transactionId: "tx-1",
+        instructions: { kind: "stellar_payment", to: "GDEPOSIT" },
         depositAddress: "GDEPOSIT",
       },
       now: Date.now(),
@@ -1438,5 +1452,29 @@ describe("amountRangeCheck gate check (sep31.amount.range)", () => {
     const r2 = await bad.run(testGateContext(c, "100"));
     expect(r2.passed).toBe(false);
     expect(r2.code).toBe("PRESETTLE_AMOUNT_OUT_OF_RANGE");
+  });
+
+  it('corridor with no quote_server reports quotes: ["none"] (#187)', () => {
+    const c = corridor({ transfer_server_sep31: "https://d.example/sep31" });
+    const adapter = new Sep31Adapter(c);
+    const caps = adapter.capabilities();
+    expect(caps.quotes).toEqual(["none"]);
+    expect(caps.protocol).toBe("sep31");
+    expect(caps.kyc).toBe("none");
+    expect(caps.settlement).toEqual(["stellar_payment"]);
+    expect(caps.refunds).toBe("report_only");
+    expect(caps.callbacks).toBe(false);
+  });
+
+  it("corridor with quote_server and kyc_server reports sep38_firm and sep12 (#187)", () => {
+    const c = corridor({
+      transfer_server_sep31: "https://d.example/sep31",
+      quote_server: "https://d.example/sep38",
+      kyc_server: "https://d.example/sep12",
+    });
+    const adapter = new Sep31Adapter(c);
+    const caps = adapter.capabilities();
+    expect(caps.quotes).toEqual(["sep38_firm"]);
+    expect(caps.kyc).toBe("sep12");
   });
 });

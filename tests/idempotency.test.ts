@@ -325,6 +325,8 @@ function fakeDb(): Queryable & { table: Map<string, Record<string, unknown>> } {
         refund_id: params[13],
         last_error: params[14],
         owner: params[15],
+        settlement: params[16],
+        manifest_hash: params[17],
       };
       // create(): INSERT … ON CONFLICT DO NOTHING RETURNING — only the first
       // writer for a key lands a row and gets it back; a conflict returns [].
@@ -341,6 +343,7 @@ function fakeDb(): Queryable & { table: Map<string, Record<string, unknown>> } {
         table.set(key, {
           ...incoming,
           refund_id: current?.refund_id ?? incoming.refund_id,
+          manifest_hash: current?.manifest_hash ?? incoming.manifest_hash,
         });
       }
       return { rows: [] as T[] };
@@ -355,6 +358,203 @@ describe("state round-trips", () => {
   it("InMemoryIdempotencyStore persists and reads back refund_pending", async () => {
     const store = new InMemoryIdempotencyStore();
     await store.put({
+      idempotencyKey: "k-rp",
+      corridorId: "c",
+      state: "refund_pending",
+      version: 4,
+      stellarTxHash: "hash_rp",
+    });
+    const got = await store.get("k-rp");
+    expect(got?.state).toBe("refund_pending");
+    expect(got?.stellarTxHash).toBe("hash_rp");
+  });
+
+  it("PostgresIdempotencyStore persists and reads back refund_pending", async () => {
+    const db = fakeDb();
+    const store = new PostgresIdempotencyStore(db);
+    await store.put({
+      idempotencyKey: "k-rp",
+      corridorId: "c",
+      state: "refund_pending",
+      version: 4,
+      stellarTxHash: "hash_rp",
+    });
+    const got = await store.get("k-rp");
+    expect(got?.state).toBe("refund_pending");
+    expect(got?.stellarTxHash).toBe("hash_rp");
+  });
+});
+
+describe("hasRequestedRefund", () => {
+  it("is the gate the refund request path asks before issuing another", () => {
+    expect(hasRequestedRefund({ refundId: "hash_back" })).toBe(true);
+    expect(hasRequestedRefund({})).toBe(false);
+    expect(hasRequestedRefund({ refundId: undefined })).toBe(false);
+    // An empty id is not evidence of anything.
+    expect(hasRequestedRefund({ refundId: "" })).toBe(false);
+  });
+});
+
+describe("refund state round-trips", () => {
+  // A run that records the payment but not the refund can request a second
+  // refund after a crash — the same class of bug the idempotency gate exists
+  // to prevent, one leg further on.
+  it("InMemoryIdempotencyStore round-trips refundId", async () => {
+    const store = new InMemoryIdempotencyStore();
+    await store.put({
+      idempotencyKey: "k-rf",
+      corridorId: "c",
+      state: "refunded",
+      version: 4,
+      stellarTxHash: "hash_out",
+      refundId: "hash_back",
+    });
+    expect((await store.get("k-rf"))?.refundId).toBe("hash_back");
+
+    await store.create({
+      idempotencyKey: "k-none",
+      corridorId: "c",
+      state: "created",
+      version: 0,
+    });
+    expect((await store.get("k-none"))?.refundId).toBeUndefined();
+  });
+
+  it("PostgresIdempotencyStore round-trips refundId", async () => {
+    const store = new PostgresIdempotencyStore(fakeDb());
+    await store.put({
+      idempotencyKey: "k-rf",
+      corridorId: "c",
+      state: "refunded",
+      version: 4,
+      stellarTxHash: "hash_out",
+      refundId: "hash_back",
+    });
+    const got = await store.get("k-rf");
+    expect(got?.refundId).toBe("hash_back");
+    expect(got?.stellarTxHash).toBe("hash_out");
+  });
+
+  it("PostgresIdempotencyStore never lets a later write erase refundId", async () => {
+    const store = new PostgresIdempotencyStore(fakeDb());
+    await store.put({
+      idempotencyKey: "k-rf",
+      corridorId: "c",
+      state: "refunded",
+      version: 4,
+      refundId: "hash_back",
+    });
+    await store.put({
+      idempotencyKey: "k-rf",
+      corridorId: "c",
+      state: "refunded",
+      version: 5,
+    });
+    expect((await store.get("k-rf"))?.refundId).toBe("hash_back");
+  });
+
+  it("ships the refund_id column in BOTH the create DDL and the additive migration", async () => {
+    // Putting it only in CREATE_TABLE_SQL would leave every deployment that
+    // predates this change without the column, silently — the `owner` column
+    // is the precedent and the comment above ALTER_TABLE_SQL explains why.
+    const seen: string[] = [];
+    await migrate({
+      async query(text: string) {
+        seen.push(text);
+        return { rows: [] };
+      },
+    });
+    expect(seen[0]).toContain("refund_id");
+    expect(
+      seen.some((sql) => sql.includes("create table if not exists corridor_resolutions")),
+    ).toBe(true);
+    expect(seen.slice(1).join("\n")).toContain("add column if not exists refund_id");
+    expect(seen[0]).toContain("deposit_address");
+    expect(seen[0]).toContain("memo");
+    expect(seen[0]).toContain("memo_type");
+    expect(seen.slice(1).join("\n")).toContain("add column if not exists deposit_address");
+    expect(seen.slice(1).join("\n")).toContain("add column if not exists memo");
+    expect(seen.slice(1).join("\n")).toContain("add column if not exists memo_type");
+  });
+
+  it("ships resume data columns in create DDL and additive migrations", async () => {
+    const seen: string[] = [];
+    await migrate({
+      async query(text: string) {
+        seen.push(text);
+        return { rows: [] };
+      },
+    });
+    for (const column of [
+      "quote_expires_at",
+      "quote_firm",
+      "settlement_amount",
+      "deposit_address",
+      "manifest_hash",
+    ]) {
+      expect(seen[0]).toContain(column);
+      expect(seen.slice(1).join("\n")).toContain(`add column if not exists ${column}`);
+    }
+  });
+});
+
+describe("PostgresIdempotencyStore", () => {
+  it("queries held runs with parameterized filters and bounded limits", async () => {
+    let captured = { text: "", params: [] as unknown[] };
+    const db: Queryable = {
+      async query(text, params = []) {
+        captured = { text, params };
+        return {
+          rows: [
+            {
+              idempotency_key: "held-1",
+              corridor_id: "corridor-a",
+              state: "held",
+              version: 4,
+              transaction_id: null,
+              quote_id: null,
+              stellar_tx_hash: "tx-hash",
+              refund_id: null,
+              last_error: "needs operator",
+              owner: null,
+            },
+          ] as never,
+        };
+      },
+    };
+    const store = new PostgresIdempotencyStore(db);
+    const runs = await store.listByState("held", { corridorId: "corridor-a", limit: 20 });
+    expect(captured.text).toContain("where state = $1 and corridor_id = $2");
+    expect(captured.text).toContain("limit $3");
+    expect(captured.params).toEqual(["held", "corridor-a", 20]);
+    expect(runs[0]).toMatchObject({ idempotencyKey: "held-1", stellarTxHash: "tx-hash" });
+  });
+
+  it("inserts out-of-band resolutions only when the run is held", async () => {
+    let captured = "";
+    const db: Queryable = {
+      async query(text) {
+        captured = text;
+        return { rows: [{ idempotency_key: "held-1" }] as never };
+      },
+    };
+    const store = new PostgresIdempotencyStore(db);
+    const inserted = await store.recordResolution({
+      idempotencyKey: "held-1",
+      outcome: "written-off",
+      note: "approved",
+      resolvedBy: "operator",
+      resolvedAt: 1_700_000_000_000,
+    });
+    expect(inserted).toBe(true);
+    expect(captured).toContain("state = 'held'");
+    expect(captured).toContain("on conflict (idempotency_key) do nothing");
+  });
+
+  it("round-trips a run and maps null columns to undefined", async () => {
+    const db = fakeDb();
+    const store = new PostgresIdempotencyStore(db);
+    const run: StoredRun = {
       idempotencyKey: "k",
       corridorId: "c",
       state: "refund_pending",
@@ -364,5 +564,22 @@ describe("state round-trips", () => {
     const got = await store.get("k");
     expect(got?.state).toBe("refund_pending");
     expect(got?.stellarTxHash).toBe("hash_rp");
+  });
+
+  it("round-trips manifestHash", async () => {
+    const db = fakeDb();
+    const store = new PostgresIdempotencyStore(db);
+    const run: StoredRun = {
+      idempotencyKey: "k-hash",
+      corridorId: "c",
+      state: "opened",
+      version: 1,
+      manifestHash: "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234",
+    };
+    await store.create(run);
+    const got = await store.get("k-hash");
+    expect(got?.manifestHash).toBe(
+      "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234",
+    );
   });
 });
