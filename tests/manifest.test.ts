@@ -240,6 +240,12 @@ describe("manifest", () => {
   });
 
   describe("liveness tiers", () => {
+    const protocolCases = [
+      { protocol: "sep31", requiredEndpoint: "transfer_server_sep31" },
+      { protocol: "sep6", requiredEndpoint: "transfer_server" },
+      { protocol: "custom:acme", requiredEndpoint: "base_url" },
+    ] as const;
+
     const verifiedCorridor = {
       ...valid,
       dest: {
@@ -257,6 +263,51 @@ describe("manifest", () => {
       expect(LIVENESS_LABEL.unverified).toBe("unverified");
       expect(LIVENESS_LABEL["not-runnable"]).toBe("not runnable");
     });
+
+    it.each(protocolCases)(
+      "reports protocol-specific not-runnable, unverified, and verified states for $protocol",
+      ({ protocol, requiredEndpoint }) => {
+        const makeCorridor = (verifiedAt?: string) =>
+          parseCorridor({
+            ...valid,
+            dest: {
+              ...valid.dest,
+              protocol,
+              endpoints: {
+                home_domain: "d.example",
+                [requiredEndpoint]: "https://d.example/endpoint",
+                ...(verifiedAt ? { endpoints_verified_at: verifiedAt } : {}),
+              },
+            },
+          });
+
+        const unverified = makeCorridor();
+        expect(unverified.ok).toBe(true);
+        if (!unverified.ok) return;
+        expect(liveness(unverified.value)).toMatchObject({
+          protocol,
+          state: "unverified",
+          runnable: false,
+        });
+
+        const verified = makeCorridor("2026-09-20");
+        expect(verified.ok).toBe(true);
+        if (!verified.ok) return;
+        expect(liveness(verified.value)).toMatchObject({
+          protocol,
+          state: "verified",
+          runnable: true,
+        });
+
+        const missing = structuredClone(verified.value);
+        Object.assign(missing.dest.endpoints, { [requiredEndpoint]: undefined });
+        expect(liveness(missing)).toMatchObject({
+          protocol,
+          state: "not-runnable",
+          runnable: false,
+        });
+      },
+    );
 
     it("reports proven when verified and fresh proof is present", () => {
       const parsed = parseCorridor({

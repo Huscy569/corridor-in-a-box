@@ -7,6 +7,308 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ## [Unreleased]
 
+### Fixed — Prometheus exposition conformance (#274)
+
+- Added HELP metadata to emitted metric families and changed timing metrics from
+  incomplete millisecond summaries to parser-compatible histograms measured in
+  seconds, with configurable cumulative buckets.
+- **Breaking metrics change:** timing families now use
+  `<name>_seconds_bucket`, `<name>_seconds_sum`, and
+  `<name>_seconds_count` instead of the previous `<name>_ms_count` and
+  `<name>_ms_sum` samples. Update dashboards and alert rules accordingly.
+- Added parser-based regression coverage for family types, HELP text, histogram
+  buckets, aggregation, and escaped labels.
+
+### Added — `PostgresAuditSink`: a durable, append-only audit trail ([#272](https://github.com/ezedike-evan/corridor-in-a-box/issues/272))
+
+The audit trail used to live only in memory, so the service lost it on every
+restart, even when `DATABASE_URL` gave it Postgres.
+
+- `PostgresAuditSink` in `@corridor/engine` writes one `corridor_audit` row per
+  state transition. A unique key on `(idempotency_key, version, to_state)` makes
+  a retried write a no-op. Route trust, fees and gate checks are kept in a
+  `detail` JSON column.
+- `listAudit(idempotencyKey)` returns a payment's trail, oldest first.
+- `migrate()` creates the table. `examples/run-service.ts` uses the sink
+  whenever `DATABASE_URL` is set.
+- `docs/operations.md` documents a service role with `SELECT`/`INSERT` only on
+  the table. It also documents what happens when an audit write fails: the
+  payment stops before its next step and resumes later, and the missed entry
+  shows up as a gap in `version`.
+- The CI `integration-postgres` job now also runs
+  `tests/integration/audit-pg.test.ts`.
+
+### Added — flaky-test quarantine (2026-10-21)
+
+A flaky test can be quarantined instead of deleted or silently skipped
+([#284](https://github.com/ezedike-evan/corridor-in-a-box/issues/284)):
+
+- `quarantine(issueUrl, name, fn)` in `tests/helpers/quarantine.ts` wraps a
+  sequential describe block tagged `[quarantine]`. The main `pnpm test` run
+  skips it.
+- `pnpm test:quarantine` runs only quarantined blocks, with `retry: 3`.
+- New non-blocking `quarantine` CI job (`continue-on-error: true`). Its job
+  summary lists each quarantined test, its issue, and the outcome.
+- `tests/quarantine.test.ts` fails if a `quarantine()` call has no GitHub issue URL.
+
+### Maintenance — removed the unused `turbo.json`
+
+- Turborepo was never installed or invoked: `pnpm typecheck` is one `tsc` pass
+  and `pnpm test` is one `vitest run`. `turbo.json` and the `.turbo` entries in
+  `.gitignore`, `.prettierignore` and `eslint.config.js` are gone, so nobody
+  assumes there is task caching
+  ([#285](https://github.com/ezedike-evan/corridor-in-a-box/issues/285)).
+
+### Added — every service request carries an `X-Request-Id` into the logs and the audit trail ([#269](https://github.com/ezedike-evan/corridor-in-a-box/issues/269))
+
+Engine logs and audit entries only carried `idempotencyKey` and `corridorId`,
+and the service neither assigned nor returned a request id — so an operator
+handed a `500` and a log file had no way to tie the two together.
+
+- `packages/service`: `server()` accepts an inbound `X-Request-Id` and echoes
+  it back on every response, including the transport-owned ones (413, 400 from
+  invalid JSON, 401, 404, 429, 500). An inbound id is used only if it is
+  `[A-Za-z0-9._-]{1,128}`; anything else is replaced with a fresh
+  `crypto.randomUUID()`, so a client cannot inject a log line or a header.
+- `packages/service`: `RouteResponse` gained `headers`, and `RouteRequest`
+  gained `requestId` / `traceparent`, so `route()` stays a pure function that
+  can be driven without a socket.
+- `packages/service`: a W3C `traceparent` is validated and passed through as a
+  field on the response and on every log line (full tracing is a separate
+  concern).
+- `packages/engine`: `ExecuteOptions.requestId` / `traceparent` scope the run —
+  `Logger.child(fields)` (new optional member, with `childLogger()` falling back
+  to merging for third-party loggers) and `scopedAuditSink()` wrap the deps once,
+  so _every_ emit site of a run inherits the id: transitions, the pre-settle
+  gate detail, reconcile polls, halt notices. `AuditEntry` and `AuditDetail`
+  gained optional `requestId` / `traceparent`.
+
+### Breaking — `StellarSettlementSubmitter` refuses mainnet unless it is opted in ([#275](https://github.com/ezedike-evan/corridor-in-a-box/issues/275))
+
+The "don't move real money by accident" check lived only in the example
+launchers (`examples/run-testnet.ts`, `examples/run-service.ts`,
+`scripts/assert-testnet-corridor.ts`), so an embedder wiring the library
+together themselves inherited no guard at all: the submitter picked the network
+straight from the manifest and signed whatever `settlement.network` said.
+
+- `packages/stellar`: `StellarSubmitterOptions.allowedNetworks`
+  (`readonly ("public" | "testnet")[]`) **defaults to `["testnet"]`**. A
+  corridor on a network that is not listed is refused with a non-retryable
+  `SETTLEMENT_FAILED` before `loadAccount()`, so a refusal costs no sequence
+  number, no signature and no transaction. **Embedders that settle on public
+  must now pass `allowedNetworks: ["testnet", "public"]`** — that is the whole
+  point, but it is a breaking construction-time change.
+- `packages/stellar`: a `LocalKeypairSigner` (including one built from
+  `signerSecret`) is refused on public unless `allowLocalSignerOnMainnet: true`
+  is also passed, per docs/key-management.md: a seed living in the application
+  process is a testnet convenience, not a mainnet custody model.
+- `packages/stellar`: the Horizon endpoint's own `network_passphrase` is read
+  from its root resource once, lazily, and compared with the corridor's
+  network — a testnet manifest pointed at a mainnet Horizon (or the reverse)
+  is refused rather than signed. An endpoint that cannot be reached fails
+  retryably; nothing was submitted, so retrying is safe. `fetchHorizonRoot` is
+  the test seam; the check is skipped when a fake `horizonServer` is injected
+  without it.
+- `examples/run-service.ts` and `examples/run-testnet.ts`: the submitter is
+  constructed with `allowedNetworks` derived from `CORRIDOR_ALLOW_MAINNET=1`,
+  so the launcher's opt-in and the signer's guard cannot drift apart.
+- `tests/stellar.test.ts`: public corridor without opt-in → refused with no
+  `loadAccount` call; local signer on public refused even with the network
+  allowed; explicit ack settles; endpoint/corridor passphrase mismatch refused
+  (root read once); unverifiable endpoint retryable.
+
+### Added — `tests/service-http.test.ts`: the service transport, tested over a socket ([#281](https://github.com/ezedike-evan/corridor-in-a-box/issues/281))
+
+`tests/service.test.ts` drives the pure `route()` in-process, which is the right
+way to test routing — but the transport in `server()` was mostly invisible to
+it: JSON parsing, the lowercasing of inbound headers, `resolveClientIp()` /
+`trustProxy`, the content types written on the way out, and the catch-all that
+turns an unexpected throw into a 500. Only the two body-size cases went through
+a real socket.
+
+- New black-box suite: mock adapters, mock submitter, a server on port 0, and
+  assertions on status bytes, headers and response bodies. It covers POST
+  `/payments` → 200 and reading that key back, 401 without a key, a mixed-case
+  `Authorization` still authenticating, a cross-tenant `GET /payments/:key` →
+  404, 429 after the token bucket drains, `/metrics` served as
+  `text/plain; version=0.0.4` verbatim and unmetered, a forged
+  `X-Forwarded-For` ignored by default and honoured under `trustProxy`, invalid
+  JSON → 400, and a rejecting store → 500 with the same server still answering
+  the next request.
+- Servers are closed through `gracefulShutdown()` in `afterEach`, not
+  `server.close()`, so nothing outlives the test.
+- 12 tests, ~0.3 s. No production code changed.
+
+### Fixed — `web/` reads corridor data and the state list from the repo, not hand copies ([#293](https://github.com/ezedike-evan/corridor-in-a-box/issues/293))
+
+`web/lib/corridors.ts` had hand-copied four of the six manifests and kept its
+own copy of `liveness()`, which still treated every lane as SEP-31. The
+payment runner hand-listed the engine's states.
+
+- `pnpm gen:web-data` (`scripts/gen-web-data.ts`) loads every
+  `corridors/*.corridor.yaml` with `@corridor/manifest` and reads the state
+  machine from `@corridor/engine`. It writes
+  `web/lib/generated/{corridors,states}.json`, which are committed.
+- `web/` imports those files and calls `@corridor/manifest`'s own `liveness()`,
+  so the site now shows all six corridors and reports SEP-6 lanes correctly.
+  Liveness is computed at render time, not generated: proof freshness depends
+  on today's date.
+- `@corridor/engine` exports `ALL_STATES`, and `CorridorState` is derived from it.
+- `tests/web-data.test.ts` and a CI step fail when the generated files are
+  stale.
+
+### Fixed — `RegistryRouteResolver` checks the protocol the corridor declares, not SEP-31 ([#211](https://github.com/ezedike-evan/corridor-in-a-box/issues/211))
+
+The registry-backed resolver asked every lane the same question — "is this
+anchor attested as serving SEP-31?" — and refused any answer that was not yes.
+A `protocol: sep6` corridor could therefore never clear the gate, and the
+tempting way to unblock it (adding the anchor to `allowUnattestedDomains`)
+would have quietly turned the evidence check off for that lane.
+
+- `packages/router`: `AttestationSource` now exposes
+  `serves(domain, protocol)` instead of `servesSep31(domain)`, and
+  `resolve()` asks about `protocolOf(corridor.dest)`. A SEP-6 lane is checked
+  against the SEP-6 probe, and the refusal message names the protocol
+  ("not attested as serving SEP-6 receive-side").
+- `packages/router`: `asAttestationSource()` adapts a source that only
+  implements `servesSep31`, answering `false` for every other protocol rather
+  than guessing — a source that cannot speak for a protocol is not evidence
+  that the anchor serves it. `AttestationSourceLike` is the union both shapes
+  are accepted as, so an embedder that already wired a source up keeps working.
+- `packages/router`: a bespoke `custom:<id>` lane has no on-chain probe at all,
+  so it now fails closed with a message that names the protocol and says why
+  ("no on-chain attestation probe"), instead of being refused for a SEP-31
+  reason it never had.
+- `packages/router`: `UnattestedAnchorError` carries the protocol it refused.
+- `packages/cli` and `examples/resolvers/allowlist-resolver.ts`: the
+  "no registry deployed" fallback source answers every protocol with the same
+  error, so an unconfigured deployment still fails closed.
+- `packages/stellar`: `tomlHashCheck` takes either shape of attestation source
+  (it only reads `tomlHash`).
+- `tests/registry-resolver.test.ts`: a SEP-6 corridor passes when
+  `serves(domain, "sep6")` is true and fails when only SEP-31 is attested; a
+  bespoke lane fails closed unless it is allowlisted; a SEP-31-only source
+  cannot wave a SEP-6 lane through. The existing cases run through the
+  compatibility adapter.
+
+### Added — a worked example of a bespoke HTTP anchor adapter ([#206](https://github.com/ezedike-evan/corridor-in-a-box/issues/206))
+
+`examples/adapters/http-stub/` is a complete, runnable `AnchorAdapter` for an
+anchor that speaks a proprietary HTTP API instead of SEP-31. `HttpStubAdapter`
+reports `native` quotes, `bespoke` KYC and `stellar_payment` deposit
+instructions, and drives the real engine end to end against a fictional API
+served in-process by an injected `fetchImpl`. `pnpm example:stub` runs it.
+
+Nothing in the example names a real anchor, host, endpoint or account: the
+destination is `anchor.example` (RFC 2606 reserves `.example` for exactly
+this), the routes are invented, and `tests/http-stub-adapter.test.ts` fails if
+a URL in the example points anywhere but a reserved example domain. The same
+test runs the conformance harness (`runConformance`) against the adapter, so a
+third party has a worked reference for the wiring _and_ the checks.
+
+The lane's manifest declares `protocol: custom:http-stub` and
+`endpoints.base_url`, so a bespoke destination is configuration rather than
+code: the engine needed no change to route through it, and
+`RegistryRouteResolver` still refuses it for want of an on-chain attestation
+probe unless the domain is explicitly allow-listed.
+
+### Fixed — the attester rejects a domain that is not in canonical form ([#246](https://github.com/ezedike-evan/corridor-in-a-box/issues/246))
+
+`attest` checked only that a domain was non-empty and `<= 253` bytes, so the
+registry — which keys records by the raw string and appends every key to the
+bounded `Domains` list — accepted `Cowrie.Exchange`, `cowrie.exchange.` and
+`https://cowrie.exchange/` as three permanent records for one anchor, each
+wasting one of 512 slots nobody can reclaim.
+
+`contracts/attester` now requires the canonical spelling: labels of lowercase
+letters and digits with `-` inside a label only, joined by single dots. A leading,
+trailing or doubled dot, a leading or trailing hyphen, uppercase, a scheme, a
+path, whitespace or any non-ASCII byte is `Error::InvalidDomain`. Ports are
+rejected deliberately, and the reason is documented on `is_canonical_domain`: a
+home domain is an origin, not a listener.
+
+`isCanonicalDomain` in `@corridor/probe` mirrors the rule byte for byte, and
+`AnchorAttester.attest` refuses a non-canonical domain before it loads the
+account or simulates, so `pnpm attest` fails on the spelling instead of paying to
+be reverted on chain. The same list of spellings is pinned in
+`contracts/attester/src/test.rs` and `tests/domain.test.ts`;
+`docs/operations.md` §0 states the rule where a fleet entry is added.
+
+### Added — `describeResolverContract`: the RouteResolver contract, executable ([#260](https://github.com/ezedike-evan/corridor-in-a-box/issues/260))
+
+A private resolver is written outside this repo against the `RouteResolver`
+interface, and until now nothing shipped with it that could tell its author
+whether it honours the documented contract — `tests/router.test.ts` and
+`tests/registry-resolver.test.ts` test the built-ins and are not reusable.
+
+`@corridor/router/testing` exports `describeResolverContract(name,
+makeResolver)`, which registers four cases: a decision carries a receiving
+anchor; the same intent twice yields the same anchor domain (resume safety);
+failure behaviour matches what the resolver documents, declared per resolver via
+`unresolvable` — `RegistryRouteResolver` refuses, `StaticRouteResolver` documents
+that it trusts the manifest; and `split`, if present, sums to 1. The suite hands
+the factory the fixtures it will resolve, so a third party wires its fakes to the
+domains it is actually tested against.
+
+`checkResolverContract` returns the report without registering anything and
+`expectResolverContract` throws naming each failed clause, which is how
+`tests/router.test.ts` proves — with `it.fails` — that a deliberately broken
+resolver really fails the suite. Both built-ins and
+`examples/resolvers/allowlist-resolver.ts` run it; `docs/route-resolver.md`
+documents it for out-of-repo authors. vitest is a peer dependency of the
+`./testing` subpath only.
+
+### Added — observed receive assets and a declared country on registry records ([#242](https://github.com/ezedike-evan/corridor-in-a-box/issues/242), design in [#241](https://github.com/ezedike-evan/corridor-in-a-box/issues/241))
+
+The registry could already answer "does this anchor serve SEP-31", but not "what
+does it actually receive", which is the question a corridor is built around. Two
+kinds of fact are recorded, and the distinction is the design:
+`receive_assets` is OBSERVED (the codes a SEP-31 `/info` response listed when the
+probe ran) and `country` is DECLARED (the anchor's own
+`[DOCUMENTATION] ORG_PHYSICAL_ADDRESS`, verified by nobody).
+
+- `docs/registry-metadata.md` records the decisions: its own `Meta(String)`
+  storage key rather than new fields on `Anchor`, a separate `attest_meta` write
+  with its own cooldown so a deployed attester keeps working and a sweep can
+  write both halves in one ledger, the bounds (32 assets, 32 characters per
+  code, 2 uppercase letters for a country), and why an empty list and an absent
+  one are different findings.
+- `contracts/registry`: `put_meta`, `get_meta`, `receives_asset`, an
+  `AnchorMeta` record, a `MetaAttested` event, and errors `TooManyAssets`,
+  `InvalidAssetCode`, `DuplicateAsset`, `InvalidCountry`. A domain with no
+  metadata reads `NotFound`, so a record written before this upgrade still
+  decodes and reports nothing invented. `bump` keeps the metadata entry alive
+  beside the record it describes.
+- `contracts/attester`: `attest_meta` gates on enrolment and cooldown, checks the
+  same bounds before relaying (so a caller sees the attester's error numbers
+  rather than a cross-contract revert), and `DataKey::LastMeta` holds its
+  cooldown separately from the bitmap write's.
+- `packages/probe`: `declaredCountry` maps an address line's last segment to
+  ISO-3166-1 alpha-2 through an allowlist of names and alpha-3 codes, and
+  returns nothing rather than guessing; `tomlValue` is still not a TOML parser.
+  `ProbeResult.country` is set only when the toml declared one.
+- `packages/attester`: `attestMeta` refuses locally when `sep31_info` produced no
+  observed list, so an empty list can only ever mean "asked, receives nothing".
+  Encodes `Option<String>` as Void/`String` and the asset list element-wise.
+- `packages/registry`: `AnchorAttestation.receiveAssets` / `.country` (absent, not
+  empty, when unrecorded), `getMeta` (null only for `NotFound`), `receivesAsset`,
+  `getAnchor(domain, { meta: true })`, and `RegistryContractError`.
+- `pnpm attest` submits both halves per domain; `pnpm registry:read` prints
+  "not recorded" beside "nothing — asked and it accepts no asset" as two lines
+  that mean different things.
+
+The testnet contracts are not redeployed by this change: `upgrade()` needs the
+enrolled operator key, so `contracts/deployments.json` still records the wasm
+that is live, and the hashes change when that job runs.
+
+### Added — `justfile` for the day-to-day commands ([#288](https://github.com/ezedike-evan/corridor-in-a-box/issues/288))
+
+`install`, `check`, `contracts`, `web`, `pg-test`, `anchor-up` / `anchor-down` /
+`anchor-doctor`, `secret-scan` and `ci`, each calling the same commands
+`.github/workflows/ci.yml` calls, so the local gate and CI cannot drift.
+`pg-test` starts and removes the Postgres container CI gets from a service, and
+`just --list` documents every recipe. CONTRIBUTING.md now points at `just ci`.
+
 ### Added — Zeam (South Africa) probed and added as the second VERIFIED lane ([#225](https://github.com/ezedike-evan/corridor-in-a-box/issues/225))
 
 `corridors/zeam.corridor.yaml` — USD → ZAR over `mint.zeam.money`, probed

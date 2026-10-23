@@ -61,7 +61,8 @@ export function manifestFromProbe(
   }
 
   // Determine receive assets
-  let receiveAssets: readonly string[] | undefined = opts.receiveAssets;
+  let receiveAssets: readonly string[] | undefined =
+    opts.receiveAssets ?? result.sep31ReceiveAssets ?? result.receiveAssets;
   if (!receiveAssets) {
     const sep31Outcome = result.outcomes.find((o) => o.probe === "sep31_info");
     if (sep31Outcome && sep31Outcome.detail.startsWith("receives ")) {

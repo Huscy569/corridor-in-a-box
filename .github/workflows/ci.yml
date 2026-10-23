@@ -12,7 +12,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: gitleaks
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
@@ -58,9 +58,39 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
+      # web/ renders corridor data and the state list generated from the
+      # manifests and the engine. Fail when the committed copy has drifted.
+      - name: Check web/lib/generated is up to date
+        run: |
+          pnpm gen:web-data
+          git diff --exit-code web/lib/generated || {
+            echo "::error::web/lib/generated is stale. Run 'pnpm gen:web-data' and commit the result."
+            exit 1
+          }
+
+  # Flaky-test quarantine (tests/helpers/quarantine.ts). Runs only the blocks
+  # tagged with quarantine(), each retried up to 3 times. Non-blocking by
+  # design: a flake must not redden main. It is not silent either: the job
+  # summary lists every quarantined test, its tracking issue, and how it did.
+  quarantine:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:quarantine --reporter=default --reporter=json --outputFile.json=quarantine-report.json
+      - name: Summarize quarantined tests
+        if: ${{ always() }}
+        run: pnpm exec tsx scripts/quarantine-summary.ts quarantine-report.json >> "$GITHUB_STEP_SUMMARY"
 
   # Exercises PostgresIdempotencyStore against a real Postgres (the atomic claim
-  # + version-guarded upsert that guard against double-settlement). The test is
+  # + version-guarded upsert that guard against double-settlement), and
+  # PostgresAuditSink (ordered, duplicate-free, append-only). The tests are
   # env-gated, so it only runs when CORRIDOR_TEST_DATABASE_URL points at the
   # service container below; the default `pnpm test` job above skips it.
   integration-postgres:
@@ -88,7 +118,7 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm exec vitest run tests/integration/idempotency-pg.test.ts
+      - run: pnpm exec vitest run --no-file-parallelism tests/integration/idempotency-pg.test.ts tests/integration/audit-pg.test.ts
 
   # The web/ showcase app is a standalone Next.js project with its own lockfile
   # (intentionally outside the pnpm workspace, see web/README.md), so it gets its
@@ -111,5 +141,6 @@ jobs:
       # root (web/pnpm-workspace.yaml, #80), so pnpm must treat it as a standalone
       # project rather than resolving the repository root workspace.
       - run: pnpm install --frozen-lockfile --ignore-workspace
+      - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm build

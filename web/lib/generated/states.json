@@ -1,0 +1,85 @@
+{
+  "states": [
+    "created",
+    "quoted",
+    "compliant",
+    "opened",
+    "verifying",
+    "settling",
+    "retrying",
+    "settled",
+    "reconciled",
+    "completed",
+    "recovering",
+    "refund_pending",
+    "refunded",
+    "held",
+    "failed"
+  ],
+  "terminal": [
+    "completed",
+    "refunded",
+    "held",
+    "failed"
+  ],
+  "next": {
+    "created": [
+      "quoted",
+      "failed"
+    ],
+    "quoted": [
+      "compliant",
+      "recovering",
+      "failed"
+    ],
+    "compliant": [
+      "opened",
+      "recovering",
+      "failed"
+    ],
+    "opened": [
+      "verifying",
+      "recovering",
+      "failed"
+    ],
+    "verifying": [
+      "settling",
+      "failed"
+    ],
+    "settling": [
+      "retrying",
+      "settled",
+      "recovering",
+      "failed"
+    ],
+    "retrying": [
+      "verifying",
+      "recovering",
+      "failed"
+    ],
+    "settled": [
+      "reconciled",
+      "recovering",
+      "failed"
+    ],
+    "reconciled": [
+      "completed",
+      "failed"
+    ],
+    "completed": [],
+    "recovering": [
+      "refund_pending",
+      "refunded",
+      "held",
+      "failed"
+    ],
+    "refund_pending": [
+      "refunded",
+      "held",
+      "failed"
+    ],
+    "refunded": [],
+    "held": [],
+    "failed": []
+  }
+}

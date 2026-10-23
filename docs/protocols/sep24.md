@@ -100,3 +100,5 @@ Forcing SEP-24 into `openTransaction` by polling inside the adapter would either
 ### Recommendation
 
 Adopt **Option C**, matching the decision in [RFC 0001](../rfcs/0001-protocol-agnostic-corridors.md): keep `corridor-in-a-box`'s state machine strictly unattended (`sep31`, `sep6`, `custom:<id>`), and keep interactive SEP-24 browser sessions at the application edge outside the core run loop.
+
+The contract for that edge session — which state is (not) added to the engine, how the interactive URL is delivered, whose timeout budget a human wait consumes, and what must be true before anything is settled — is pinned in [RFC 0003](../rfcs/0003-sep24-interactive-handoff.md).

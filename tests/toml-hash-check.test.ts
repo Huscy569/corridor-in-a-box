@@ -55,7 +55,7 @@ function context(domain = DOMAIN): GateContext {
 
 function source(hash: string): AttestationSource {
   return {
-    servesSep31: async () => true,
+    serves: async () => true,
     staleness: async () => 0,
     tomlHash: async () => hash,
   };

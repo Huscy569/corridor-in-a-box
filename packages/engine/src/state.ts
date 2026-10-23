@@ -3,22 +3,27 @@
 // a monotonic version after each transition so a crashed run can be resumed and
 // reconciled rather than lost.
 
-export type CorridorState =
-  | "created"
-  | "quoted"
-  | "compliant"
-  | "opened"
-  | "verifying"
-  | "settling"
-  | "retrying"
-  | "settled"
-  | "reconciled"
-  | "completed"
-  | "recovering"
-  | "refund_pending"
-  | "refunded"
-  | "held"
-  | "failed";
+// Every state, as a runtime array the type is derived from, so tooling that
+// needs the list (scripts/gen-web-data.ts) reads it instead of copying it.
+export const ALL_STATES = [
+  "created",
+  "quoted",
+  "compliant",
+  "opened",
+  "verifying",
+  "settling",
+  "retrying",
+  "settled",
+  "reconciled",
+  "completed",
+  "recovering",
+  "refund_pending",
+  "refunded",
+  "held",
+  "failed",
+] as const;
+
+export type CorridorState = (typeof ALL_STATES)[number];
 
 const NEXT: Record<CorridorState, readonly CorridorState[]> = {
   created: ["quoted", "failed"],

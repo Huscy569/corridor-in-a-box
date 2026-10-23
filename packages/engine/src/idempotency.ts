@@ -7,7 +7,7 @@
 // InMemoryIdempotencyStore is for tests/examples. In production back this with
 // Postgres (a row per idempotencyKey, optimistic concurrency on `version`).
 
-import type { Money } from "@corridor/types";
+import type { Money, SettlementRef } from "@corridor/types";
 import type { CorridorState } from "./state";
 
 export interface StoredRun {
@@ -30,6 +30,8 @@ export interface StoredRun {
   quoteFirm?: boolean;
   settlementAmount?: string;
   stellarTxHash?: string;
+  settlementKind?: "stellar" | "adapter";
+  settlementRef?: SettlementRef;
   depositAddress?: string;
   memo?: string;
   memoType?: "text" | "hash" | "id";
@@ -99,6 +101,18 @@ export interface ListRunsOptions {
  */
 export function hasRequestedRefund(run: Pick<StoredRun, "refundId">): boolean {
   return run.refundId !== undefined && run.refundId !== "";
+}
+
+/**
+ * True when the run has recorded a settlement reference (on-chain or off-chain).
+ */
+export function hasSettlementRef(
+  run: Pick<StoredRun, "settlementRef" | "stellarTxHash">,
+): boolean {
+  return (
+    run.settlementRef !== undefined ||
+    (run.stellarTxHash !== undefined && run.stellarTxHash !== "")
+  );
 }
 
 export interface IdempotencyStore {

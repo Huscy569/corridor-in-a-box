@@ -11,7 +11,8 @@ import {
   getCorridor,
   liveness,
   LIVENESS_LABEL,
-  type Endpoints,
+  endpoint,
+  type EndpointKey,
 } from "@/lib/corridors";
 import { fetchAttestations, REGISTRY_ID, REGISTRY_NETWORK } from "@/lib/registry";
 
@@ -40,9 +41,10 @@ export async function generateMetadata({
 }
 
 /** Manifest field → the stellar.toml key it is copied from, for the endpoints table. */
-const ENDPOINT_ROWS: { key: keyof Endpoints; toml: string }[] = [
+const ENDPOINT_ROWS: { key: EndpointKey; toml: string }[] = [
   { key: "home_domain", toml: "—" },
   { key: "transfer_server_sep31", toml: "DIRECT_PAYMENT_SERVER" },
+  { key: "transfer_server", toml: "TRANSFER_SERVER" },
   { key: "web_auth", toml: "WEB_AUTH_ENDPOINT" },
   { key: "kyc_server", toml: "KYC_SERVER" },
   { key: "quote_server", toml: "ANCHOR_QUOTE_SERVER" },
@@ -161,8 +163,8 @@ export default async function CorridorPage({ params }: { params: Promise<{ id: s
                     <td className="py-2 pr-4 font-mono text-xs text-secondary-text">
                       {row.toml}
                     </td>
-                    <EndpointValue value={corridor.source.endpoints[row.key]} />
-                    <EndpointValue value={corridor.dest.endpoints[row.key]} />
+                    <EndpointValue value={endpoint(corridor.source.endpoints, row.key)} />
+                    <EndpointValue value={endpoint(corridor.dest.endpoints, row.key)} />
                   </tr>
                 ))}
               </tbody>

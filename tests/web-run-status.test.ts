@@ -128,7 +128,8 @@ describe("the payment form's controls are associated with their labels", () => {
   });
 
   it("keeps a live region for the outcome", () => {
-    expect(source).toMatch(/role="status"/);
+    // <output> carries the implicit ARIA role "status", so either form is a live region.
+    expect(source).toMatch(/role="status"|<output\b/);
     expect(source).toMatch(/aria-live="polite"/);
   });
 });

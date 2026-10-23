@@ -21,6 +21,7 @@
       "@corridor/engine": ["../packages/engine/src/index.ts"],
       "@corridor/adapter-kit": ["../packages/adapter-kit/src/index.ts"],
       "@corridor/manifest": ["../packages/manifest/src/index.ts"],
+      "@corridor/manifest/liveness": ["../packages/manifest/src/liveness.ts"],
       "@corridor/router": ["../packages/router/src/index.ts"],
       "@corridor/types": ["../packages/types/src/index.ts"],
       "@corridor/probe": ["../packages/probe/src/index.ts"],

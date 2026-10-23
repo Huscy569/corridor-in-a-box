@@ -286,4 +286,108 @@ run("PostgresIdempotencyStore (live Postgres)", () => {
     const res = await s.list({ owner: "alice", limit: 1000 });
     expect(res.length).toBeLessThanOrEqual(100);
   });
+
+  it("round-trips settlementKind and settlementRef (adapter and stellar)", async () => {
+    const s = store();
+    await s.create(newRun("k-adapter"));
+    await s.put({
+      idempotencyKey: "k-adapter",
+      corridorId: "c",
+      state: "settled",
+      version: 2,
+      settlementKind: "adapter",
+      settlementRef: {
+        kind: "adapter",
+        reference: "ref_12345",
+        reportedAt: 1700000000000,
+      },
+    });
+    const gotAdapter = await s.get("k-adapter");
+    expect(gotAdapter?.settlementKind).toBe("adapter");
+    expect(gotAdapter?.settlementRef).toEqual({
+      kind: "adapter",
+      reference: "ref_12345",
+      reportedAt: 1700000000000,
+    });
+    expect(gotAdapter?.stellarTxHash).toBeUndefined();
+
+    await s.create(newRun("k-stellar"));
+    await s.put({
+      idempotencyKey: "k-stellar",
+      corridorId: "c",
+      state: "settled",
+      version: 2,
+      stellarTxHash: "tx_stellar_hash_99",
+      settlementKind: "stellar",
+      settlementRef: {
+        kind: "stellar",
+        stellarTxHash: "tx_stellar_hash_99",
+        ledger: 100,
+      },
+    });
+    const gotStellar = await s.get("k-stellar");
+    expect(gotStellar?.settlementKind).toBe("stellar");
+    expect(gotStellar?.stellarTxHash).toBe("tx_stellar_hash_99");
+    expect(gotStellar?.settlementRef).toEqual({
+      kind: "stellar",
+      stellarTxHash: "tx_stellar_hash_99",
+      ledger: 100,
+    });
+  });
+
+  it("adds settlement_kind and settlement_ref to a table created by the previous version", async () => {
+    await pool.query("drop table if exists corridor_resolutions");
+    await pool.query("drop table if exists corridor_runs");
+    await pool.query(`
+      create table corridor_runs (
+        idempotency_key text primary key,
+        corridor_id     text not null,
+        state           text not null,
+        version         integer not null,
+        transaction_id  text,
+        quote_id        text,
+        stellar_tx_hash text,
+        last_error      text,
+        owner           text,
+        updated_at      timestamptz not null default now()
+      );`);
+    await pool.query(
+      `insert into corridor_runs (idempotency_key, corridor_id, state, version, stellar_tx_hash)
+       values ('legacy-settled', 'c', 'settled', 1, 'tx_legacy_hash')`,
+    );
+
+    await migrate(pool as unknown as Queryable);
+
+    const s = store();
+    // Legacy row with stellar_tx_hash maps to stellar kind and ref
+    const legacy = await s.get("legacy-settled");
+    expect(legacy?.stellarTxHash).toBe("tx_legacy_hash");
+    expect(legacy?.settlementKind).toBe("stellar");
+    expect(legacy?.settlementRef).toEqual({
+      kind: "stellar",
+      stellarTxHash: "tx_legacy_hash",
+    });
+
+    // And new writes to settlement_kind and settlement_ref succeed on the migrated table
+    await s.create(newRun("migrated-adapter"));
+    await s.put({
+      idempotencyKey: "migrated-adapter",
+      corridorId: "c",
+      state: "settled",
+      version: 2,
+      settlementKind: "adapter",
+      settlementRef: {
+        kind: "adapter",
+        reference: "ref_migrated",
+        reportedAt: 12345,
+      },
+    });
+    const got = await s.get("migrated-adapter");
+    expect(got?.settlementKind).toBe("adapter");
+    expect(got?.settlementRef).toEqual({
+      kind: "adapter",
+      reference: "ref_migrated",
+      reportedAt: 12345,
+    });
+  });
 });

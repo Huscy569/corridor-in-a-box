@@ -4,7 +4,7 @@ use super::*;
 use soroban_sdk::{
     testutils::storage::{Instance as _, Persistent as _},
     testutils::{Address as _, Events as _, Ledger as _},
-    Address, BytesN, Env, Event as _, String,
+    Address, BytesN, Env, Event as _, String, Vec,
 };
 
 /// Bit indices, mirroring SEP_NUMBERS / PROBE_NAMES. Spelled out here rather
@@ -593,4 +593,372 @@ fn emits_full_attested_event_payload() {
     }
     .to_xdr(&f.env, &f.client.address);
     assert_eq!(events[0], expected);
+}
+
+// ─── Metadata: observed receive assets, declared country ─────────────────────
+//
+// The two halves of a domain's record are written and read separately, and the
+// tests below are the ones that matter most for the upgrade: an anchor record
+// that predates metadata must stay readable, untouched, and must not silently
+// gain an empty list that a consumer would read as "receives nothing".
+
+fn codes(env: &Env, list: &[&str]) -> Vec<String> {
+    let mut v = Vec::new(env);
+    for c in list {
+        v.push_back(String::from_str(env, c));
+    }
+    v
+}
+
+fn country(env: &Env, code: &str) -> Option<String> {
+    Some(String::from_str(env, code))
+}
+
+/// Thirty-three distinct codes: enough to sit on both sides of
+/// `MAX_RECEIVE_ASSETS` without tripping the duplicate check first.
+const ASSET_NAMES: [&str; 33] = [
+    "A0", "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "B0", "B1", "B2", "B3", "B4", "B5",
+    "B6", "B7", "B8", "B9", "C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "D0", "D1",
+    "D2",
+];
+
+/// An asset code exactly `MAX_ASSET_CODE_LEN` long, and one byte past it.
+/// Written out rather than built so the length they assert is the length here.
+const AT_LIMIT_CODE: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+const OVER_LIMIT_CODE: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456";
+
+/// Attest the record, then write metadata on top of it — the order a sweep
+/// submits in.
+fn put_meta(f: &Fixture, d: &String, list: &[&str], c: Option<String>) {
+    f.client.put_meta(d, &codes(&f.env, list), &c, &f.attester);
+}
+
+#[test]
+fn stores_and_reads_back_metadata() {
+    let f = setup();
+    f.env.ledger().set_sequence_number(2_000);
+    let d = domain(&f.env);
+    put(&f, &d);
+
+    put_meta(&f, &d, &["NGN", "KES"], country(&f.env, "NG"));
+
+    let meta = f.client.get_meta(&d);
+    assert_eq!(meta.domain, d);
+    assert_eq!(meta.receive_assets, codes(&f.env, &["NGN", "KES"]));
+    assert_eq!(meta.country, country(&f.env, "NG"));
+    assert_eq!(meta.attested_ledger, 2_000);
+    assert_eq!(meta.attester, f.attester);
+}
+
+#[test]
+fn a_metadata_write_leaves_the_record_it_describes_alone() {
+    let f = setup();
+    f.env.ledger().set_sequence_number(1_000);
+    let d = domain(&f.env);
+    put(&f, &d);
+    let before = f.client.get_anchor(&d);
+
+    f.env.ledger().set_sequence_number(5_000);
+    put_meta(&f, &d, &["NGN"], country(&f.env, "NG"));
+
+    // Same bits, same toml hash, same attested ledger: metadata is a second key,
+    // not a rewrite of the first. The two clocks stay distinguishable.
+    let after = f.client.get_anchor(&d);
+    assert_eq!(after, before);
+    assert_eq!(after.attested_ledger, 1_000);
+    assert_eq!(f.client.get_meta(&d).attested_ledger, 5_000);
+    assert_eq!(f.client.staleness(&d), 4_000);
+}
+
+#[test]
+fn re_attesting_the_record_does_not_erase_metadata() {
+    let f = setup();
+    let d = domain(&f.env);
+    put(&f, &d);
+    put_meta(&f, &d, &["NGN", "XOF"], country(&f.env, "NG"));
+
+    put(&f, &d);
+
+    assert_eq!(
+        f.client.get_meta(&d).receive_assets,
+        codes(&f.env, &["NGN", "XOF"])
+    );
+}
+
+#[test]
+fn a_record_with_no_metadata_reads_not_found_rather_than_empty() {
+    // The pre-upgrade case: a record written by the previous version of this
+    // contract. It must read exactly as it did before, and its absence of
+    // metadata must not be reported as an anchor that receives nothing.
+    let f = setup();
+    let d = domain(&f.env);
+    put(&f, &d);
+
+    let record = f.client.get_anchor(&d);
+    assert_eq!(record.domain, d);
+    assert!(f.client.serves_sep31(&d));
+
+    assert_eq!(f.client.try_get_meta(&d), Err(Ok(Error::NotFound)));
+    assert_eq!(
+        f.client
+            .try_receives_asset(&d, &String::from_str(&f.env, "NGN")),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn metadata_about_an_unattested_domain_is_refused() {
+    let f = setup();
+    let d = String::from_str(&f.env, "never-attested.example");
+
+    let res = f.client.try_put_meta(
+        &d,
+        &codes(&f.env, &["NGN"]),
+        &country(&f.env, "NG"),
+        &f.attester,
+    );
+    assert_eq!(res, Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn receives_asset_answers_from_the_observed_list() {
+    let f = setup();
+    let d = domain(&f.env);
+    put(&f, &d);
+    put_meta(&f, &d, &["NGN", "KES"], country(&f.env, "NG"));
+
+    assert!(f
+        .client
+        .receives_asset(&d, &String::from_str(&f.env, "NGN")));
+    // Not a substring, not a prefix, not a currency of the declared country.
+    assert!(!f.client.receives_asset(&d, &String::from_str(&f.env, "NG")));
+    assert!(!f
+        .client
+        .receives_asset(&d, &String::from_str(&f.env, "USDC")));
+}
+
+#[test]
+fn an_empty_receive_list_is_a_finding_not_an_absence() {
+    // testanchor.stellar.org: advertises SEP-31, `/info` lists nothing. That is
+    // the fact the registry exists to record, so it has to be storable.
+    let f = setup();
+    let d = domain(&f.env);
+    put(&f, &d);
+
+    put_meta(&f, &d, &[], None);
+
+    let meta = f.client.get_meta(&d);
+    assert_eq!(meta.receive_assets.len(), 0);
+    assert_eq!(meta.country, None);
+    assert!(!f
+        .client
+        .receives_asset(&d, &String::from_str(&f.env, "NGN")));
+}
+
+#[test]
+fn declares_no_country_without_inventing_one() {
+    let f = setup();
+    let d = domain(&f.env);
+    put(&f, &d);
+
+    put_meta(&f, &d, &["NGN"], None);
+    assert_eq!(f.client.get_meta(&d).country, None);
+
+    // A later sweep that does read a declaration replaces the absence.
+    put_meta(&f, &d, &["NGN"], country(&f.env, "NG"));
+    assert_eq!(f.client.get_meta(&d).country, country(&f.env, "NG"));
+
+    // And clearing a declaration that has gone away is expressible too.
+    put_meta(&f, &d, &["NGN"], None);
+    assert_eq!(f.client.get_meta(&d).country, None);
+}
+
+// --- bounds: the registry does not store whatever it is handed ---------------
+
+#[test]
+fn rejects_more_assets_than_the_bound_allows() {
+    let f = setup();
+    let d = domain(&f.env);
+    put(&f, &d);
+
+    // Exactly at the bound is accepted — the limit is a ceiling, not an
+    // off-by-one trap for an honest writer.
+    f.client
+        .put_meta(&d, &codes(&f.env, &ASSET_NAMES[..32]), &None, &f.attester);
+    assert_eq!(
+        f.client.get_meta(&d).receive_assets.len(),
+        MAX_RECEIVE_ASSETS
+    );
+
+    // One past it is refused.
+    let res = f
+        .client
+        .try_put_meta(&d, &codes(&f.env, &ASSET_NAMES), &None, &f.attester);
+    assert_eq!(res, Err(Ok(Error::TooManyAssets)));
+}
+
+#[test]
+fn rejects_an_asset_code_that_is_not_a_code() {
+    let f = setup();
+    let d = domain(&f.env);
+    put(&f, &d);
+
+    assert_eq!(
+        f.client
+            .try_put_meta(&d, &codes(&f.env, &[""]), &None, &f.attester),
+        Err(Ok(Error::InvalidAssetCode))
+    );
+
+    assert_eq!(
+        f.client
+            .try_put_meta(&d, &codes(&f.env, &[OVER_LIMIT_CODE]), &None, &f.attester),
+        Err(Ok(Error::InvalidAssetCode))
+    );
+
+    // At the bound, accepted.
+    f.client
+        .put_meta(&d, &codes(&f.env, &[AT_LIMIT_CODE]), &None, &f.attester);
+}
+
+#[test]
+fn rejects_the_same_asset_written_twice() {
+    // len() is a count of assets an anchor receives; a list with a duplicate in
+    // it would make that number a lie.
+    let f = setup();
+    let d = domain(&f.env);
+    put(&f, &d);
+
+    assert_eq!(
+        f.client.try_put_meta(
+            &d,
+            &codes(&f.env, &["NGN", "KES", "ngn"]),
+            &None,
+            &f.attester
+        ),
+        Ok(Ok(()))
+    );
+    assert_eq!(
+        f.client.try_put_meta(
+            &d,
+            &codes(&f.env, &["NGN", "KES", "NGN"]),
+            &None,
+            &f.attester
+        ),
+        Err(Ok(Error::DuplicateAsset))
+    );
+}
+
+#[test]
+fn rejects_a_country_that_is_not_alpha2() {
+    let f = setup();
+    let d = domain(&f.env);
+    put(&f, &d);
+
+    for bad in ["ng", "NGA", "N", "", "N1"] {
+        let res = f.client.try_put_meta(
+            &d,
+            &codes(&f.env, &["NGN"]),
+            &country(&f.env, bad),
+            &f.attester,
+        );
+        assert_eq!(res, Err(Ok(Error::InvalidCountry)), "accepted {bad:?}");
+    }
+
+    f.client
+        .put_meta(&d, &codes(&f.env, &["NGN"]), &None, &f.attester);
+}
+
+#[test]
+fn emits_its_own_event_for_metadata() {
+    let f = setup();
+    f.env.ledger().set_sequence_number(7_777);
+    let d = domain(&f.env);
+
+    let seps = SEP31;
+    let probes = PROBE_SEP31_INFO;
+    let toml_hash = hash(&f.env, 1);
+    f.client
+        .put_anchor(&d, &seps, &toml_hash, &probes, &probes, &f.attester);
+
+    // The unit-test host reports the events of the invocation that just ran, so
+    // each write is read back on its own. What is pinned is that a metadata
+    // write publishes `meta_attested` and nothing else — it neither rides on the
+    // bitmap event nor replaces it, which is what lets an indexer follow a sweep
+    // that writes the two halves in one ledger.
+    let all_events = f.env.events().all();
+    let events = all_events.events();
+    assert_eq!(events.len(), 1);
+    let expected_attested = Attested {
+        domain: d.clone(),
+        seps,
+        toml_hash,
+        probes_run: probes,
+        probes_passed: probes,
+        attested_ledger: 7_777,
+        attester: f.attester.clone(),
+    }
+    .to_xdr(&f.env, &f.client.address);
+    assert_eq!(events[0], expected_attested);
+
+    let list = codes(&f.env, &["NGN"]);
+    let c = country(&f.env, "NG");
+    f.client.put_meta(&d, &list, &c, &f.attester);
+
+    let all_events = f.env.events().all();
+    let events = all_events.events();
+    assert_eq!(events.len(), 1);
+    let expected_meta = MetaAttested {
+        domain: d,
+        receive_assets: list,
+        country: c,
+        attested_ledger: 7_777,
+        attester: f.attester.clone(),
+    }
+    .to_xdr(&f.env, &f.client.address);
+    assert_eq!(events[0], expected_meta);
+}
+
+#[test]
+fn a_metadata_write_extends_the_metadata_entry() {
+    let f = setup();
+    let d = domain(&f.env);
+    put(&f, &d);
+    put_meta(&f, &d, &["NGN"], country(&f.env, "NG"));
+
+    let meta_ttl = f.env.as_contract(&f.client.address, || {
+        f.env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::Meta(d.clone()))
+    });
+    assert_eq!(meta_ttl, TTL_EXTEND_TO);
+}
+
+#[test]
+fn bump_keeps_metadata_alive_alongside_the_record() {
+    // Metadata expires on its own key. If bump only extended the record, a quiet
+    // domain would answer get_anchor forever while get_meta archived away — a
+    // record that slowly loses half its facts.
+    let f = setup();
+    let d = domain(&f.env);
+    put(&f, &d);
+    put_meta(&f, &d, &["NGN"], country(&f.env, "NG"));
+
+    advance(&f, TTL_EXTEND_TO - 100);
+    f.client.bump(&d);
+
+    let (record_ttl, meta_ttl) = f.env.as_contract(&f.client.address, || {
+        (
+            f.env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::Anchor(d.clone())),
+            f.env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::Meta(d.clone())),
+        )
+    });
+    assert_eq!(record_ttl, TTL_EXTEND_TO);
+    assert_eq!(meta_ttl, TTL_EXTEND_TO);
 }

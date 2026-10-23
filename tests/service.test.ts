@@ -6,11 +6,13 @@ import { parseCorridor, type Corridor } from "@corridor/manifest";
 import { createMockAdapter } from "@corridor/adapter-kit";
 import { StaticRouteResolver } from "@corridor/router";
 import {
+  InMemoryAuditLog,
   InMemoryIdempotencyStore,
   createMockSubmitter,
   type EngineDeps,
+  type Logger,
 } from "@corridor/engine";
-import { createService, type ServiceOptions } from "@corridor/service";
+import { createService, gracefulShutdown, type ServiceOptions } from "@corridor/service";
 import type { CorridorErrorCode, PaymentIntent } from "@corridor/types";
 
 function corridor(): Corridor {
@@ -664,5 +666,195 @@ describe("service: storeCheck helper", () => {
     );
     expect(check.name).toBe("pg");
     await expect(check.check()).rejects.toThrow("db down");
+  });
+});
+
+// --- request-id correlation ------------------------------------------------
+// A 500 at the edge is worthless on its own: without an id there is nothing to
+// grep for in the log or the audit trail. These pin the round trip — the id the
+// caller gets back is the id every line behind it was written under.
+
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/** Every line the engine logs, captured with its fields. */
+function captureLogger(): {
+  logger: Logger;
+  lines: { msg: string; fields: Record<string, unknown> }[];
+} {
+  const lines: { msg: string; fields: Record<string, unknown> }[] = [];
+  return {
+    lines,
+    logger: {
+      log: (_level, msg, fields) => {
+        lines.push({ msg, fields: { ...(fields ?? {}) } });
+      },
+    },
+  };
+}
+
+/** One request over a real socket, with the response headers kept readable. */
+function call(
+  port: number,
+  method: string,
+  path: string,
+  opts: { body?: string; headers?: Record<string, string> } = {},
+): Promise<{
+  status: number;
+  headers: Record<string, string | string[] | undefined>;
+  body: string;
+}> {
+  return new Promise((resolve, reject) => {
+    const req = request(
+      { host: "127.0.0.1", port, method, path, headers: opts.headers, agent: false },
+      (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () =>
+          resolve({ status: res.statusCode ?? 0, headers: res.headers, body: data }),
+        );
+      },
+    );
+    req.on("error", reject);
+    req.end(opts.body);
+  });
+}
+
+describe("service: X-Request-Id propagation", () => {
+  it("mints a request id and echoes it when the caller sent none", async () => {
+    const r = await svc().route({ method: "GET", path: "/healthz" });
+    const id = r.headers?.["x-request-id"];
+    expect(id).toMatch(UUID_V4);
+  });
+
+  it("echoes a valid inbound id verbatim", async () => {
+    const inbound = "job.2026-01_A-99";
+    const r = await svc().route({
+      method: "GET",
+      path: "/healthz",
+      headers: { "x-request-id": inbound },
+    });
+    expect(r.headers?.["x-request-id"]).toBe(inbound);
+  });
+
+  it("replaces an inbound id that is too long or has the wrong charset", async () => {
+    for (const inbound of ["has space", "x".repeat(129), "drop\r\nInjected: 1", ""]) {
+      const r = await svc().route({
+        method: "GET",
+        path: "/healthz",
+        headers: { "x-request-id": inbound },
+      });
+      const id = r.headers?.["x-request-id"];
+      expect(id).not.toBe(inbound);
+      expect(id).toMatch(UUID_V4);
+    }
+  });
+
+  it("echoes the id even on a rejected request (401) and an unknown path (404)", async () => {
+    const guarded = svc({ apiKeys: new Set(["k1"]) });
+    const unauth = await guarded.route({
+      method: "POST",
+      path: "/payments",
+      body: intentBody(),
+    });
+    expect(unauth.status).toBe(401);
+    expect(unauth.headers?.["x-request-id"]).toMatch(UUID_V4);
+
+    const missing = await svc().route({
+      method: "GET",
+      path: "/nope",
+      headers: { "x-request-id": "trace-me-1" },
+    });
+    expect(missing.status).toBe(404);
+    expect(missing.headers?.["x-request-id"]).toBe("trace-me-1");
+  });
+
+  it("stamps the request id on every engine log line and audit entry the payment produced", async () => {
+    const audit = new InMemoryAuditLog();
+    const { logger, lines } = captureLogger();
+    const s = svc({ deps: { ...deps(), logger, audit } });
+
+    const r = await s.route({
+      method: "POST",
+      path: "/payments",
+      body: intentBody("rid-run"),
+      headers: { "x-request-id": "rid-run" },
+    });
+    expect(r.status).toBe(200);
+    expect(r.headers?.["x-request-id"]).toBe("rid-run");
+
+    // Nothing is logged without the id, and nothing carries a different one.
+    expect(lines.length).toBeGreaterThan(0);
+    for (const line of lines) {
+      expect(line.fields.requestId).toBe("rid-run");
+    }
+    expect(audit.entries.length).toBeGreaterThan(0);
+    for (const entry of audit.entries) {
+      expect(entry.requestId).toBe("rid-run");
+    }
+    expect(audit.details.length).toBeGreaterThan(0);
+    for (const detail of audit.details) {
+      expect(detail.requestId).toBe("rid-run");
+    }
+  });
+
+  it("passes a well-formed traceparent through, and drops a malformed one", async () => {
+    const audit = new InMemoryAuditLog();
+    const { logger, lines } = captureLogger();
+    const s = svc({ deps: { ...deps(), logger, audit } });
+    const traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    const ok = await s.route({
+      method: "POST",
+      path: "/payments",
+      body: intentBody("rid-trace"),
+      headers: { "x-request-id": "rid-trace", traceparent },
+    });
+    expect(ok.status).toBe(200);
+    expect(ok.headers?.traceparent).toBe(traceparent);
+    expect(lines.some((l) => l.fields.traceparent === traceparent)).toBe(true);
+    expect(audit.entries.every((e) => e.traceparent === traceparent)).toBe(true);
+
+    const bad = await s.route({
+      method: "GET",
+      path: "/healthz",
+      headers: { traceparent: "00-not-a-trace-id-00f067aa0ba902b7-01" },
+    });
+    expect(bad.headers?.traceparent).toBeUndefined();
+    expect(bad.headers?.["x-request-id"]).toMatch(UUID_V4);
+  });
+
+  it("sends the id back over the socket, including on the transport's own errors", async () => {
+    const s = svc({ maxBodyBytes: 64 });
+    const srv = s.server();
+    srv.listen(0);
+    await once(srv, "listening");
+    const { port } = srv.address() as AddressInfo;
+    try {
+      // A route-level response carries it...
+      const health = await call(port, "GET", "/healthz", {
+        headers: { "x-request-id": "sock-1" },
+      });
+      expect(health.status).toBe(200);
+      expect(health.headers["x-request-id"]).toBe("sock-1");
+
+      // ...and so does one the transport answers itself, before routing.
+      const junk = await call(port, "POST", "/payments", {
+        body: "{not json",
+        headers: { "x-request-id": "sock-2", "content-type": "application/json" },
+      });
+      expect(junk.status).toBe(400);
+      expect(junk.headers["x-request-id"]).toBe("sock-2");
+      expect(JSON.parse(junk.body)).toEqual({ error: "invalid JSON" });
+
+      // And on the 413 that never touches the router at all.
+      const huge = await call(port, "POST", "/payments", {
+        body: JSON.stringify({ blob: "x".repeat(500) }),
+        headers: { "x-request-id": "sock-3", "content-type": "application/json" },
+      });
+      expect(huge.status).toBe(413);
+      expect(huge.headers["x-request-id"]).toBe("sock-3");
+    } finally {
+      await gracefulShutdown(srv, s, { graceMs: 200 });
+    }
   });
 });

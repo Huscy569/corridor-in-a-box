@@ -1,0 +1,56 @@
+# A fictional corridor for the bespoke HTTP-stub adapter.
+#
+# Nothing here names a real anchor, a real host or a real network: the
+# destination is "anchor.example" (RFC 2606 reserves `.example` for exactly
+# this), the payout asset is a made-up ISO-4217 code, and the settlement
+# network is testnet. The manifest is here to show the SHAPE of a bespoke lane
+# — `protocol: custom:<id>` plus `endpoints.base_url` — not to describe a lane
+# that exists.
+#
+# Note what a bespoke lane does NOT declare: there is no
+# `transfer_server_sep31`, because this anchor speaks a proprietary HTTP API
+# and not SEP-31. `liveness()` reasons in SEP-31 terms, so it reports this
+# lane as "not runnable"; the engine only refuses an unrunnable lane on the
+# public network, and this one is testnet.
+id: http-stub-demo
+
+status_note: >-
+  Fictional demo lane for the bespoke HTTP-stub adapter. Not a real corridor.
+
+source:
+  name: Example Sender
+  asset: USDC
+  endpoints:
+    home_domain: sender.example
+
+dest:
+  name: Example Bespoke Anchor
+  asset: "iso4217:XTS"
+  protocol: custom:http-stub
+  endpoints:
+    home_domain: anchor.example
+    base_url: https://anchor.example
+
+fx:
+  path: ["XTS", "USDC", "XTS"]
+  # The anchor prices the pair itself over its own API — a "native" quote, not
+  # a SEP-38 quote server.
+  quote_source: native
+  who_holds_risk: receiving_anchor
+  quote_ttl_seconds: 60
+
+compliance:
+  source_jurisdiction: US
+  dest_jurisdiction: US
+  travel_rule_profile: default
+
+settlement:
+  bridge_asset: USDC
+  network: testnet
+  # A made-up issuer account: the demo never signs or submits anything.
+  asset_issuer: GEXAMPLESTUBISSUERACCOUNT2222222222222222222222222222222
+
+recovery:
+  max_retries: 3
+  timeout_seconds: 900
+  rollback: refund_sender

@@ -6,9 +6,17 @@ import {
   UnattestedAnchorError,
   createAdapterRegistry,
   loadResolver,
+  ROUTE_RESOLVER_API_VERSION,
+  type AttestationSource,
   type LoadResolverCtx,
+  type RouteDecision,
   type RouteResolver,
 } from "@corridor/router";
+import {
+  checkResolverContract,
+  describeResolverContract,
+  expectResolverContract,
+} from "@corridor/router/testing";
 import { parseCorridor, type Corridor } from "@corridor/manifest";
 import type { AnchorAdapter } from "@corridor/adapter-kit";
 import type { PaymentIntent } from "@corridor/types";
@@ -59,6 +67,8 @@ describe("StaticRouteResolver", () => {
   });
 
   it("registry resolver reports trust: 'attested'", async () => {
+    // The older, SEP-31-only source shape: it is adapted, so an embedder that
+    // already wired one up keeps working.
     const registry = {
       servesSep31: async () => true,
       staleness: async () => 0,
@@ -338,4 +348,118 @@ describe("createAdapterRegistry", () => {
     });
     await expect(resolver.resolve(intent, sep6Corridor("c6"))).rejects.toThrow(/sep6/);
   });
+});
+
+// --- the factory contract version exported for loaders ---------------------
+
+describe("ROUTE_RESOLVER_API_VERSION", () => {
+  it("is exported as the integer 1, the version documented in docs/route-resolver.md", () => {
+    expect(ROUTE_RESOLVER_API_VERSION).toBe(1);
+  });
+});
+
+// --- describeResolverContract(): the contract, executable ------------------
+// A private resolver is written outside this repo, against the interface in
+// `packages/router/src/index.ts`. `@corridor/router/testing` is how it proves it
+// honours the documented contract; the built-ins run the same suite, so the
+// suite cannot drift away from the resolvers it claims to describe.
+
+/** The fixture home domains the suite resolves and refuses. */
+const RESOLVED_DOMAIN = "resolved.example";
+const UNRESOLVABLE_DOMAIN = "unresolvable.example";
+
+/** An adapter whose name IS its home domain, so case 2 compares domains. */
+function adapterForDomain(corridor: Corridor): AnchorAdapter {
+  return { name: corridor.dest.endpoints.home_domain } as AnchorAdapter;
+}
+
+/** Attests the resolved domain and nothing else. */
+function fakeRegistry(): AttestationSource {
+  return {
+    serves: async (domain) => domain === RESOLVED_DOMAIN,
+    staleness: async () => 0,
+    tomlHash: async () => "0".repeat(64),
+  };
+}
+
+describeResolverContract(
+  "StaticRouteResolver",
+  () => new StaticRouteResolver(adapterForDomain, { trustManifestWithoutAttestation: true }),
+  {
+    // What StaticRouteResolver documents: it trusts the manifest, for every
+    // corridor, and says so. It is not a gate, so it does not refuse.
+    unresolvable: { outcome: "resolves", trust: "manifest" },
+  },
+);
+
+describeResolverContract(
+  "RegistryRouteResolver",
+  () =>
+    new RegistryRouteResolver({
+      registry: fakeRegistry(),
+      adapterFor: adapterForDomain,
+    }),
+  { unresolvable: { outcome: "rejects", errorPattern: /not attested as serving SEP-31/ } },
+);
+
+// The third-party shape, held to the same suite: an out-of-package resolver
+// loaded through `loadResolver`.
+describeResolverContract(
+  "examples/resolvers/allowlist-resolver.ts",
+  () =>
+    loadResolver(
+      {
+        module: EXAMPLE,
+        options: { domains: [RESOLVED_DOMAIN, UNRESOLVABLE_DOMAIN], registry: fakeRegistry() },
+      },
+      { adapterFor: adapterForDomain },
+    ),
+  { unresolvable: { outcome: "rejects", errorPattern: /not attested as serving SEP-31/ } },
+);
+
+// A green run of the suite has to be capable of meaning something, so the
+// fixture below breaks all four clauses on purpose.
+function brokenResolver(): RouteResolver {
+  let calls = 0;
+  const stub = { name: "stub" } as AnchorAdapter;
+  return {
+    async resolve(_intent, corridor) {
+      if (corridor.dest.endpoints.home_domain === UNRESOLVABLE_DOMAIN) {
+        // (3) routes a domain it has no evidence for, instead of refusing it.
+        return { receiving: stub, trust: "manifest" };
+      }
+      calls += 1;
+      return {
+        // (1) a `trust` this interface does not define.
+        trust: "scored" as RouteDecision["trust"],
+        // (2) changes its mind between calls: a resumed payment would settle
+        //     its second half somewhere else.
+        receiving: { name: `anchor-${calls}` } as AnchorAdapter,
+        // (4) weights that do not sum to 1.
+        split: [
+          { adapter: stub, weight: 0.5 },
+          { adapter: stub, weight: 0.5 },
+          { adapter: stub, weight: 0.3 },
+        ],
+      };
+    },
+  };
+}
+
+it.fails("describeResolverContract fails a resolver that breaks the contract", async () => {
+  const report = await checkResolverContract("BrokenResolver", () => brokenResolver());
+  expectResolverContract(report);
+});
+
+it("says which clause a broken resolver fails", async () => {
+  const report = await checkResolverContract("BrokenResolver", () => brokenResolver());
+  expect(report.passed).toBe(false);
+  expect(
+    report.results.map((r) => r.passed),
+    report.results.map((r) => r.detail).join("\n"),
+  ).toEqual([false, false, false, false]);
+  expect(report.results[0].detail).toContain("scored");
+  expect(report.results[1].detail).toContain("anchor-1 then anchor-2");
+  expect(report.results[2].detail).toContain(UNRESOLVABLE_DOMAIN);
+  expect(report.results[3].detail).toMatch(/weights sum to/);
 });

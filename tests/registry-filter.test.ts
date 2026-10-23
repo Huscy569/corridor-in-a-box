@@ -18,6 +18,8 @@ function att(
     tomlHash: over.tomlHash ?? "0".repeat(64),
     attestedLedger: over.attestedLedger ?? 100,
     attester: over.attester ?? "GATTESTER",
+    ...(over.receiveAssets !== undefined ? { receiveAssets: over.receiveAssets } : {}),
+    ...(over.country !== undefined ? { country: over.country } : {}),
   };
 }
 
@@ -102,5 +104,85 @@ describe("filterAttestations", () => {
 
   it("returns nothing when no record can satisfy the filters", () => {
     expect(filterAttestations(RECORDS, STALENESS, { sep: [38] })).toEqual([]);
+  });
+});
+
+// Metadata filters answer "who pays out MXN / in PH". A record attested before
+// metadata existed has neither field, and "not recorded" must never read as a
+// match, or the upgrade would quietly widen every answer.
+describe("filterAttestations: country and asset", () => {
+  const META: readonly AnchorAttestation[] = [
+    att("mx.example", { receiveAssets: ["MXN", "USDC"], country: "MX" }),
+    att("ph.example", { receiveAssets: ["PHP"], country: "PH" }),
+    att("nothing.example", { receiveAssets: [], country: "MX" }),
+    att("undeclared.example", { receiveAssets: ["MXN"] }),
+    // Attested before the upgrade: no receive list, no country.
+    att("legacy.example"),
+  ];
+  const fresh = Object.fromEntries(META.map((r) => [r.domain, 1]));
+
+  it("keeps only anchors that declared the country", () => {
+    expect(domains(filterAttestations(META, fresh, { country: "MX" }))).toEqual([
+      "mx.example",
+      "nothing.example",
+    ]);
+  });
+
+  it("never matches a country on a record that declared none", () => {
+    const filtered = filterAttestations(META, fresh, { country: "PH" });
+    expect(domains(filtered)).toEqual(["ph.example"]);
+  });
+
+  it("keeps only anchors observed receiving the asset", () => {
+    expect(domains(filterAttestations(META, fresh, { asset: ["MXN"] }))).toEqual([
+      "mx.example",
+      "undeclared.example",
+    ]);
+  });
+
+  it("requires every asset when several are given", () => {
+    expect(domains(filterAttestations(META, fresh, { asset: ["MXN", "USDC"] }))).toEqual([
+      "mx.example",
+    ]);
+  });
+
+  it("does not let an empty receive list match an asset", () => {
+    expect(
+      domains(filterAttestations(META, fresh, { asset: ["MXN"], country: "MX" })),
+    ).toEqual(["mx.example"]);
+  });
+
+  it("drops records attested before metadata existed from both filters", () => {
+    expect(domains(filterAttestations(META, fresh, { asset: ["PHP"] }))).toEqual([
+      "ph.example",
+    ]);
+    expect(domains(filterAttestations(META, fresh, { country: "PH" }))).not.toContain(
+      "legacy.example",
+    );
+  });
+
+  it("leaves legacy records in when neither metadata filter is given", () => {
+    expect(domains(filterAttestations(META, fresh, { asset: [] }))).toContain(
+      "legacy.example",
+    );
+    expect(domains(filterAttestations(META, fresh))).toContain("legacy.example");
+  });
+
+  it("intersects with sep, passed and maxAge", () => {
+    const records = [
+      att("a.example", { seps: [31], receiveAssets: ["MXN"], country: "MX" }),
+      att("b.example", { seps: [24], receiveAssets: ["MXN"], country: "MX" }),
+    ];
+    const filtered = filterAttestations(
+      records,
+      { "a.example": 10, "b.example": 10 },
+      { sep: [31], maxAge: 100, country: "MX", asset: ["MXN"] },
+    );
+    expect(domains(filtered)).toEqual(["a.example"]);
+  });
+
+  it("compares codes exactly, as the contract stores them", () => {
+    expect(filterAttestations(META, fresh, { country: "mx" })).toEqual([]);
+    expect(filterAttestations(META, fresh, { asset: ["mxn"] })).toEqual([]);
   });
 });

@@ -74,6 +74,9 @@ another transfer SEP is a new adapter, not an engine change:
   which is why it is out of scope today. See
   [docs/protocols/sep24.md](./protocols/sep24.md) for a full breakdown of the
   SEP-24 interactive lifecycle, state-machine implications, and options considered.
+  Anchors that publish only SEP-6/SEP-24 (for example Anclap, pending the probe
+  recorded in the issue) are blocked on the SEP-6 adapter and cannot yet be
+  onboarded as SEP-31 corridors.
 
 ## External quotes (`fx.quote_source: external`)
 
@@ -111,3 +114,13 @@ while supplying `transfer_server` are rejected with an error instructing the aut
 
 See also [why-not-anchor-platform.md](./why-not-anchor-platform.md) for how this
 relates to the SDF Anchor Platform (the server side an anchor runs).
+
+## SEP-24 interactive handoff
+
+The question "should the engine ever support an interactive SEP-24 handoff?"
+is answered in [RFC 0003](./rfcs/0003-sep24-interactive-handoff.md): no. The
+engine stays unattended, and an interactive session — if a product ever needs
+one — belongs to an edge session service that hands the engine a _finished_
+deposit. [RFC 0003](./rfcs/0003-sep24-interactive-handoff.md) pins the contract:
+which state is (not) added, how the URL is delivered, whose timeout budget a
+human wait consumes, and what must be true before anything is settled.

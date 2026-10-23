@@ -296,6 +296,7 @@ describe("probeAnchor", () => {
       "sep6_auth",
     ]);
     expect(r.tomlHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(r.sep31ReceiveAssets).toEqual(["USDC"]);
   });
 
   // The case that got this project rejected, reproduced as a test: the toml
@@ -307,6 +308,7 @@ describe("probeAnchor", () => {
     expect(decodeSeps(r.seps)).toContain(31); // advertised
     expect(ran(r, "sep31_info")).toBe(true); // we checked
     expect(passed(r, "sep31_info")).toBe(false); // and it does not work
+    expect(r.sep31ReceiveAssets).toBeUndefined();
   });
 
   it("passes sep6_info with non-empty withdraw or withdraw-exchange list, fails when empty", async () => {
@@ -481,6 +483,29 @@ ANCHOR_QUOTE_SERVER = "https://a.example/sep38"
     const sep31 = r.outcomes.find((o) => o.probe === "sep31_info");
     expect(sep31?.passed).toBe(false);
     expect(sep31?.detail).toContain("EMPTY");
+  });
+
+  describe("sep31ReceiveAssets structured data (#231)", () => {
+    it("is populated on a passing SEP-31 probe", async () => {
+      const { fetchImpl } = stub({ sep31Receive: ["NGNT", "USDC"] });
+      const r = await probeAnchor("a.example", { fetchImpl });
+      expect(passed(r, "sep31_info")).toBe(true);
+      expect(r.sep31ReceiveAssets).toEqual(["NGNT", "USDC"]);
+    });
+
+    it("is undefined on empty receive list", async () => {
+      const { fetchImpl } = stub({ sep31Receive: null });
+      const r = await probeAnchor("a.example", { fetchImpl });
+      expect(passed(r, "sep31_info")).toBe(false);
+      expect(r.sep31ReceiveAssets).toBeUndefined();
+    });
+
+    it("is undefined when SEP-31 is not advertised", async () => {
+      const { fetchImpl } = stub({ toml: 'VERSION = "2.0.0"\n' });
+      const r = await probeAnchor("a.example", { fetchImpl });
+      expect(decodeSeps(r.seps)).not.toContain(31);
+      expect(r.sep31ReceiveAssets).toBeUndefined();
+    });
   });
 });
 

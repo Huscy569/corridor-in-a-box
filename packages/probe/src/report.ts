@@ -50,8 +50,9 @@ export const isUsableSep31OffRamp = (result: ProbeResult): boolean => isUsableSe
  * Extract received assets accepted by the anchor from the probe result.
  */
 export function extractReceiveAssets(result: ProbeResult): string[] {
-  if (result.receiveAssets && result.receiveAssets.length > 0) {
-    return [...result.receiveAssets];
+  const assets = result.sep31ReceiveAssets ?? result.receiveAssets;
+  if (assets && assets.length > 0) {
+    return [...assets];
   }
   const outcome = result.outcomes.find((o) => o.probe === "sep31_info" && o.passed);
   if (outcome?.detail.startsWith("receives ")) {

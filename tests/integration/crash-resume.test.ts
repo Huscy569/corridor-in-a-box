@@ -106,7 +106,10 @@ function trackingSubmitter(inner: SettlementSubmitter): {
   const submitter: SettlementSubmitter = {
     async submit(req) {
       const r = await inner.submit(req);
-      if (r.ok) hashes.push(r.value.stellarTxHash);
+      if (r.ok) {
+        expect(r.value.kind).toBe("stellar");
+        if (r.value.kind === "stellar") hashes.push(r.value.stellarTxHash);
+      }
       return r;
     },
     ...(inner.findExisting

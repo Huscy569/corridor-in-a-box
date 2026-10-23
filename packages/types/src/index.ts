@@ -158,5 +158,29 @@ export interface PaymentIntent {
   readonly destinationFields?: Readonly<Record<string, string>>;
 }
 
+// --- Settlement references ----------------------------------------------
+export type SettlementRef =
+  | {
+      readonly kind: "stellar";
+      readonly stellarTxHash: string;
+      readonly ledger?: number;
+      /** Network fee actually charged, in stroops, as Horizon's `fee_charged` reports it. */
+      readonly feeCharged?: string;
+      /** Stellar claimable balance id (when created via createClaimableBalance). */
+      readonly claimableBalanceId?: string;
+    }
+  | {
+      readonly kind: "adapter";
+      readonly reference: string;
+      readonly reportedAt: number;
+    };
+
+export function settlementId(ref: SettlementRef): string {
+  if (ref.kind === "adapter") {
+    return ref.reference;
+  }
+  return ref.stellarTxHash;
+}
+
 // --- Decimal-safe money math ---------------------------------------------
 export * from "./money";

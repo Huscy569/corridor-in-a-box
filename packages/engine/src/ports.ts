@@ -9,17 +9,17 @@
 
 import type { Corridor } from "@corridor/manifest";
 import { fail, ok, type Money, type Outcome } from "@corridor/types";
-import type { DepositInstructions, OpenTransaction, Quote } from "@corridor/adapter-kit";
+import {
+  type AnchorAdapter,
+  type DepositInstructions,
+  type OpenTransaction,
+  type Quote,
+  type SettlementRef,
+  settlementId,
+} from "@corridor/adapter-kit";
 import { buildSettlementRequest } from "./verbs";
 
-export interface SettlementRef {
-  readonly stellarTxHash: string;
-  readonly ledger?: number;
-  /** Network fee actually charged, in stroops, as Horizon's `fee_charged` reports it. */
-  readonly feeCharged?: string;
-  /** Stellar claimable balance id (when created via createClaimableBalance). */
-  readonly claimableBalanceId?: string;
-}
+export { type SettlementRef, settlementId };
 
 export interface SettlementRequest {
   readonly to: string;
@@ -135,15 +135,14 @@ export interface SettlementStrategyContext {
   readonly opened: OpenTransaction;
   readonly quote: Quote;
   readonly corridor: Corridor;
+  readonly adapter?: AnchorAdapter;
 }
 
 /**
  * A pluggable settlement strategy. The engine dispatches to the strategy whose
  * `kind` matches the deposit instructions returned by the receiving anchor.
  *
- * Today only `"stellar_payment"` is supported. When issue #183 lands and
- * `OpenTransaction.instructions.kind` becomes a discriminated union, add a
- * strategy per new kind without changing the engine's core.
+ * Supported kinds: `"stellar_payment"`, `"adapter_settled"`.
  *
  * @example
  * ```ts
@@ -186,14 +185,57 @@ export class StellarPaymentStrategy implements SettlementStrategy {
 }
 
 /**
+ * SettlementStrategy for off-chain / adapter-settled transactions (#186).
+ * Dispatches to `adapter.confirmSettlement(transactionId)` when implemented.
+ * When the adapter does not implement `confirmSettlement`, accepts pre-declared
+ * `instructions.reference` on `adapter_settled` deposit instructions as proof of
+ * settlement (for anchors where the opened transaction itself confirms pre-funding).
+ */
+export class AdapterSettledStrategy implements SettlementStrategy {
+  readonly kind: DepositInstructionsKind = "adapter_settled";
+
+  constructor(private readonly adapter?: AnchorAdapter) {}
+
+  async settle(ctx: SettlementStrategyContext): Promise<Outcome<SettlementRef>> {
+    const adapter = this.adapter ?? ctx.adapter;
+    if (!adapter) {
+      return fail(
+        "SETTLEMENT_FAILED",
+        "no AnchorAdapter available for adapter_settled strategy",
+        { retryable: false },
+      );
+    }
+    if (!adapter.confirmSettlement) {
+      if (
+        ctx.opened.instructions.kind === "adapter_settled" &&
+        ctx.opened.instructions.reference
+      ) {
+        return ok<SettlementRef>({
+          kind: "adapter",
+          reference: ctx.opened.instructions.reference,
+          reportedAt: Date.now(),
+        });
+      }
+      return fail(
+        "SETTLEMENT_FAILED",
+        `adapter "${adapter.name}" does not implement confirmSettlement`,
+        { retryable: false },
+      );
+    }
+    return adapter.confirmSettlement(ctx.opened.transactionId);
+  }
+}
+
+/**
  * Derive the default strategy list when `EngineDeps.strategies` is absent.
- * Wraps the supplied `submitter` in a `StellarPaymentStrategy` so existing
- * callers require no changes.
+ * Wraps the supplied `submitter` in a `StellarPaymentStrategy` and includes
+ * an `AdapterSettledStrategy` for off-chain settlements.
  */
 export function defaultStrategies(
   submitter: SettlementSubmitter,
+  adapter?: AnchorAdapter,
 ): readonly SettlementStrategy[] {
-  return [new StellarPaymentStrategy(submitter)];
+  return [new StellarPaymentStrategy(submitter), new AdapterSettledStrategy(adapter)];
 }
 
 /**
@@ -239,7 +281,11 @@ export function createMockSubmitter(
           retryable: true,
         });
       }
-      const reference = { stellarTxHash: hash("mocktx"), ledger: 1_000_000 + n };
+      const reference: SettlementRef = {
+        kind: "stellar",
+        stellarTxHash: hash("mocktx"),
+        ledger: 1_000_000 + n,
+      };
       submitted.push({ request: req, reference });
       return ok<SettlementRef>(reference);
     },
@@ -262,7 +308,11 @@ export function createMockSubmitter(
           retryable: false,
         });
       }
-      return ok<SettlementRef>({ stellarTxHash: hash("mockrf"), ledger: 1_000_000 + n });
+      return ok<SettlementRef>({
+        kind: "stellar",
+        stellarTxHash: hash("mockrf"),
+        ledger: 1_000_000 + n,
+      });
     },
   };
 }

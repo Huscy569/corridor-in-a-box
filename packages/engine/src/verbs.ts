@@ -131,6 +131,7 @@ export async function settle(
   opened: OpenTransaction,
   q: Quote,
   corridor: Corridor,
+  adapter?: AnchorAdapter,
 ): Promise<Outcome<SettlementRef>> {
   // Refuse before anything is submitted: never relabel an asset or round an amount silently.
   const problem = settleQuoteProblem(q, corridor);
@@ -148,7 +149,7 @@ export async function settle(
       { retryable: false },
     );
   }
-  return strategy.settle({ opened, quote: q, corridor });
+  return strategy.settle({ opened, quote: q, corridor, adapter });
 }
 
 // 4. RECONCILE — match the on-chain leg against the anchor's view of the payout.

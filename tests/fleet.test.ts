@@ -15,12 +15,15 @@ describe("contracts/anchors.json fleet", () => {
       "connect.clickpesa.com",
       "coins.ph",
       "vibrantapp.com",
+      "anclap.com.ar",
       "stellar.moneygram.com",
       "mercuryo.io",
       "lightnet.io",
       "owlting.com",
       "arf.one",
       "stellar-sep-24.banxa.com",
+      "flutterwave.com",
+      "bitso.com",
     ]);
     expect(fleet.anchors.map((a) => ({ domain: a.domain, kind: a.kind }))).toEqual([
       { domain: "testanchor.stellar.org", kind: "test" },
@@ -33,12 +36,15 @@ describe("contracts/anchors.json fleet", () => {
       { domain: "connect.clickpesa.com", kind: "other" },
       { domain: "coins.ph", kind: "other" },
       { domain: "vibrantapp.com", kind: "other" },
+      { domain: "anclap.com.ar", kind: "offramp" },
       { domain: "stellar.moneygram.com", kind: "other" },
       { domain: "mercuryo.io", kind: "other" },
       { domain: "lightnet.io", kind: "other" },
       { domain: "owlting.com", kind: "other" },
       { domain: "arf.one", kind: "other" },
       { domain: "stellar-sep-24.banxa.com", kind: "other" },
+      { domain: "flutterwave.com", kind: "other" },
+      { domain: "bitso.com", kind: "other" },
     ]);
   });
 

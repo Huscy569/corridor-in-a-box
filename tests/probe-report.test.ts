@@ -98,6 +98,15 @@ describe("pure report builders (@corridor/probe/report)", () => {
   });
 
   describe("extractReceiveAssets", () => {
+    it("extracts from sep31ReceiveAssets property if present", () => {
+      const withSep31: ProbeResult = {
+        ...COWRIE_FIXTURE,
+        sep31ReceiveAssets: ["NGNT", "USDC"],
+        receiveAssets: undefined,
+      };
+      expect(extractReceiveAssets(withSep31)).toEqual(["NGNT", "USDC"]);
+    });
+
     it("extracts from receiveAssets property if present", () => {
       expect(extractReceiveAssets(COWRIE_FIXTURE)).toEqual(["NGNT", "USDC"]);
     });
@@ -105,6 +114,7 @@ describe("pure report builders (@corridor/probe/report)", () => {
     it("parses receives from outcome detail when receiveAssets is omitted", () => {
       const withoutProperty: ProbeResult = {
         ...COWRIE_FIXTURE,
+        sep31ReceiveAssets: undefined,
         receiveAssets: undefined,
       };
       expect(extractReceiveAssets(withoutProperty)).toEqual(["NGNT", "USDC"]);

@@ -22,6 +22,7 @@ import {
   RegistryRouteResolver,
   ROUTE_RESOLVER_API_VERSION,
   type AttestationSource,
+  type AttestationSourceLike,
   type LoadResolverCtx,
   type RouteDecision,
   type RouteResolver,
@@ -56,8 +57,13 @@ export interface AllowlistResolverOptions {
    * this exists for programmatic callers and tests; leave it unset in a deploy.
    */
   readonly wrap?: RouteResolver;
-  /** Attestation source for the default RegistryRouteResolver. */
-  readonly registry?: AttestationSource;
+  /**
+   * Attestation source for the default RegistryRouteResolver. Either shape is
+   * accepted: a source that can only answer the SEP-31 question is adapted and
+   * answers `false` for every other protocol, so it can never wave a SEP-6
+   * lane through.
+   */
+  readonly registry?: AttestationSourceLike;
   readonly maxStalenessLedgers?: number;
   /** Passed through to the default RegistryRouteResolver. */
   readonly allowUnattestedDomains?: readonly string[];
@@ -109,7 +115,7 @@ async function defaultRegistry(): Promise<AttestationSource> {
   const reason =
     "no registry configured (set REGISTRY_CONTRACT_ID; see contracts/deployments.json)";
   return {
-    servesSep31: async (): Promise<boolean> => {
+    serves: async (): Promise<boolean> => {
       throw new Error(reason);
     },
     staleness: async (): Promise<number> => {

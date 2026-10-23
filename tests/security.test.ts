@@ -6,13 +6,14 @@
 // actually hold" stays visible in one place — every one of these passed the type
 // checker and the old test suite while being wrong.
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createService } from "@corridor/service";
 import { createMockAdapter } from "@corridor/adapter-kit";
 import { StaticRouteResolver } from "@corridor/router";
 import { loadCorridor, type Corridor } from "@corridor/manifest";
 import { InMemoryIdempotencyStore, type SettlementRef } from "@corridor/engine";
 import { Sep31Adapter } from "@corridor/sep31";
+import * as corridorTypes from "@corridor/types";
 import { isSettleableAmount, isValidAmount, type Outcome } from "@corridor/types";
 
 const loaded = loadCorridor("corridors/reference.corridor.yaml");
@@ -42,7 +43,10 @@ function recordingSubmitter() {
     submitter: {
       async submit(req: { amount: { asset: string; amount: string } }) {
         sent.push(req.amount);
-        return { ok: true as const, value: { stellarTxHash: "hash", ledger: 1 } };
+        return {
+          ok: true as const,
+          value: { kind: "stellar" as const, stellarTxHash: "hash", ledger: 1 },
+        };
       },
       async refund(): Promise<Outcome<SettlementRef>> {
         return {
@@ -57,13 +61,17 @@ function recordingSubmitter() {
 function service(opts: {
   apiKeys?: Set<string>;
   rateLimit?: { capacity: number; refillPerSec: number };
+  rateLimiter?: { take(key: string): boolean | Promise<boolean> };
   store?: InMemoryIdempotencyStore;
   submitter?: ReturnType<typeof recordingSubmitter>["submitter"];
+  now?: () => number;
 }) {
   return createService({
     corridors: new Map([[CORRIDOR.id, CORRIDOR]]),
     apiKeys: opts.apiKeys,
     rateLimit: opts.rateLimit,
+    rateLimiter: opts.rateLimiter,
+    now: opts.now,
     deps: {
       resolver: new StaticRouteResolver(() => createMockAdapter(), {
         trustManifestWithoutAttestation: true,
@@ -157,6 +165,17 @@ describe("run ownership (IDOR)", () => {
     expect(JSON.stringify(asBob.body)).not.toContain("hash");
   });
 
+  it("continues to accept legacy Set<string> API keys", async () => {
+    const svc = service({ apiKeys: new Set(["legacy-key"]) });
+    const response = await svc.route({
+      method: "GET",
+      path: "/payments/missing",
+      headers: { authorization: "Bearer legacy-key" },
+    });
+    // Authentication succeeded; the requested run simply does not exist.
+    expect(response.status).toBe(404);
+  });
+
   it("never returns the raw lastError message to a caller", async () => {
     const store = new InMemoryIdempotencyStore();
     await store.create({
@@ -182,6 +201,51 @@ describe("run ownership (IDOR)", () => {
 });
 
 describe("rate limiting", () => {
+  it("compares every configured secret using constantTimeEqual", async () => {
+    const comparisons: string[] = [];
+    const constantTimeEqual = corridorTypes.constantTimeEqual;
+    const compareSpy = vi
+      .spyOn(corridorTypes, "constantTimeEqual")
+      .mockImplementation((candidate, presented) => {
+        comparisons.push(candidate);
+        return constantTimeEqual(candidate, presented);
+      });
+    try {
+      const svc = service({
+        apiKeys: new Set(["before", "matched", "after"]),
+        rateLimit: { capacity: 10, refillPerSec: 1 },
+      });
+      const response = await svc.route({
+        method: "GET",
+        path: "/payments/missing",
+        headers: { authorization: "Bearer matched" },
+      });
+      expect(response.status).toBe(404);
+      // Matching occurs once for limiter identity and once for authentication.
+      // Each pass must compare every configured candidate, including after a match.
+      expect(comparisons).toEqual([
+        "before",
+        "matched",
+        "after",
+        "before",
+        "matched",
+        "after",
+      ]);
+    } finally {
+      compareSpy.mockRestore();
+    }
+  });
+
+  it("returns 401 for an invalid bearer credential", async () => {
+    const svc = service({ apiKeys: new Set(["configured-key"]) });
+    const response = await svc.route({
+      method: "GET",
+      path: "/payments/missing",
+      headers: { authorization: "Bearer invalid-key" },
+    });
+    expect(response.status).toBe(401);
+  });
+
   // The 401 used to return BEFORE the limiter, so wrong keys cost the attacker
   // nothing and could be tried at line rate.
   it("rate-limits failed authentication attempts", async () => {

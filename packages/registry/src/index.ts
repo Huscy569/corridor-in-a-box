@@ -37,6 +37,41 @@ export type ProbeName = (typeof PROBE_NAMES)[number];
 /** Protocols the registry can answer a "does this anchor serve it" query for. */
 export type Protocol = "sep31" | "sep6";
 
+/**
+ * Registry CONTRACT error codes, by their numeric value. Mirrors `enum Error` in
+ * `contracts/registry/src/lib.rs` — keep the two in step.
+ *
+ * `NotFound` is the one a caller branches on: it is the normal answer for a
+ * domain attested before metadata existed, not a failure.
+ */
+export enum RegistryContractError {
+  AlreadyInitialised = 1,
+  NotInitialised = 2,
+  PassedExceedsRun = 3,
+  UnknownBit = 4,
+  RegistryFull = 5,
+  NotFound = 6,
+  TooManyAssets = 7,
+  InvalidAssetCode = 8,
+  DuplicateAsset = 9,
+  InvalidCountry = 10,
+}
+
+/**
+ * The numeric contract error inside a simulation failure's message, if it names
+ * one.
+ *
+ * A read that reverts is reported as a message ("registry.get_meta failed:
+ * HostError: Error(Contract, #6)"), and deciding "is this the expected absence of
+ * metadata" from the English wording would be guessing. This pulls the number out
+ * so callers can compare it against {@link RegistryContractError}.
+ */
+export function contractErrorCode(error: unknown): number | undefined {
+  const message = error instanceof Error ? error.message : String(error);
+  const m = message.match(/Error\(Contract, #(\d+)\)/);
+  return m ? Number(m[1]) : undefined;
+}
+
 export interface AnchorAttestation {
   readonly domain: string;
   /** SEP numbers the anchor's stellar.toml advertises. */
@@ -50,6 +85,34 @@ export interface AnchorAttestation {
   /** Ledger at which this was attested. */
   readonly attestedLedger: number;
   /** Address that produced the attestation. */
+  readonly attester: string;
+  /**
+   * OBSERVED: asset codes the anchor's SEP-31 `/info` listed as receivable.
+   *
+   * Absent, not empty, when nobody has attested metadata for this domain — a
+   * record written before metadata existed, or one whose probe never reached
+   * `/info`. An empty array here means the opposite: it was asked, and the
+   * anchor receives nothing.
+   */
+  readonly receiveAssets?: readonly string[];
+  /**
+   * DECLARED, not verified: the ISO-3166-1 alpha-2 country from the anchor's own
+   * stellar.toml. Absent when the toml declared none in a machine-readable form.
+   */
+  readonly country?: string;
+}
+
+/** Metadata as stored under its own key on chain. */
+export interface AnchorMetadata {
+  readonly domain: string;
+  readonly receiveAssets: readonly string[];
+  readonly country?: string;
+  /**
+   * Ledger the metadata was read at. Separate from the record's
+   * `attestedLedger`, because the two are written by separate calls — metadata
+   * from last week is not evidence about this week's bitmaps.
+   */
+  readonly attestedLedger: number;
   readonly attester: string;
 }
 
@@ -76,6 +139,18 @@ export interface AttestationFilter {
   readonly passed?: readonly ProbeName[];
   /** The attestation must be no staler than this many ledgers. */
   readonly maxAge?: number;
+  /**
+   * The anchor must have DECLARED this ISO-3166-1 alpha-2 country, compared
+   * exactly (the contract only stores uppercase). A record with no declared
+   * country never matches.
+   */
+  readonly country?: string;
+  /**
+   * The anchor must have been OBSERVED receiving every one of these asset
+   * codes, compared exactly. A record with no recorded receive list — one
+   * attested before metadata existed — never matches.
+   */
+  readonly asset?: readonly string[];
 }
 
 /**
@@ -86,20 +161,27 @@ export interface AttestationFilter {
  * network read per filter. Filters intersect, so a record is kept only when it
  * satisfies every supplied condition and adding a filter never widens the
  * result. A domain missing from `stalenessByDomain` cannot satisfy `maxAge` and
- * is dropped rather than assumed fresh.
+ * is dropped rather than assumed fresh. Likewise a record with no metadata
+ * cannot satisfy `country` or `asset`: "not recorded" is not a match.
  */
 export function filterAttestations(
   records: readonly AnchorAttestation[],
   stalenessByDomain: Readonly<Record<string, number>>,
   opts: AttestationFilter = {},
 ): AnchorAttestation[] {
-  const { sep, passed, maxAge } = opts;
+  const { sep, passed, maxAge, country, asset } = opts;
   return records.filter((record) => {
     if (sep && !sep.every((n) => record.seps.includes(n))) return false;
     if (passed && !passed.every((p) => record.probesPassed.includes(p))) return false;
     if (maxAge !== undefined) {
       const age = stalenessByDomain[record.domain];
       if (age === undefined || age > maxAge) return false;
+    }
+    if (country !== undefined && record.country !== country) return false;
+    if (asset && asset.length > 0) {
+      const received = record.receiveAssets;
+      if (received === undefined || !asset.every((code) => received.includes(code)))
+        return false;
     }
     return true;
   });
@@ -127,6 +209,17 @@ function decodeBits<T>(mask: number, names: readonly T[]): T[] {
   return names.filter((_, i) => (mask & (1 << i)) !== 0);
 }
 
+/**
+ * The declared country as an optional property, or no property at all.
+ *
+ * On chain `None` decodes to `null`; spreading `undefined` into a record would
+ * leave a `country` key that JSON and `Object.keys` treat as a real value, so a
+ * caller reading metadata back could not tell "no country" from "not decoded".
+ */
+function metaCountry(raw: { country?: string | null }): { country?: string } {
+  return raw.country ? { country: raw.country } : {};
+}
+
 /** Raw shape the contract returns, before it is turned into something readable. */
 interface RawRecord {
   domain: string;
@@ -134,6 +227,15 @@ interface RawRecord {
   toml_hash: Uint8Array;
   probes_run: number;
   probes_passed: number;
+  attested_ledger: number;
+  attester: string;
+}
+
+/** Raw shape of `get_meta`'s return value. */
+interface RawMeta {
+  domain: string;
+  receive_assets: string[];
+  country: string | null;
   attested_ledger: number;
   attester: string;
 }
@@ -187,10 +289,19 @@ export class AnchorRegistry {
     return this.read<string[]>("domains");
   }
 
-  /** Full attestation for a domain. Throws if the domain has never been attested. */
-  async getAnchor(domain: string): Promise<AnchorAttestation> {
+  /**
+   * Full attestation for a domain. Throws if the domain has never been attested.
+   *
+   * With `{ meta: true }` the metadata is merged into the same record, so a
+   * caller that wants both halves makes one call and gets one object. It is
+   * opt-in because it costs a second read and because metadata is often absent:
+   * leaving it off means `getAnchor` keeps returning exactly what the
+   * attestation says, and nothing is silently missing when the caller never
+   * asked.
+   */
+  async getAnchor(domain: string, opts: { meta?: boolean } = {}): Promise<AnchorAttestation> {
     const raw = await this.read<RawRecord>("get_anchor", nativeToScValString(domain));
-    return {
+    const anchor: AnchorAttestation = {
       domain: raw.domain,
       seps: decodeBits(raw.seps, SEP_NUMBERS),
       probesRun: decodeBits(raw.probes_run, PROBE_NAMES),
@@ -199,6 +310,54 @@ export class AnchorRegistry {
       attestedLedger: raw.attested_ledger,
       attester: raw.attester,
     };
+    if (!opts.meta) return anchor;
+    const meta = await this.getMeta(domain);
+    if (meta === null) return anchor;
+    return { ...anchor, receiveAssets: meta.receiveAssets, ...metaCountry(meta) };
+  }
+
+  /**
+   * Observed receive assets and declared country for a domain, or `null` when
+   * the registry holds no metadata for it.
+   *
+   * `null` is only the answer to "there is no metadata here", which is the
+   * normal state of a domain attested before metadata existed. Every other
+   * reversion is rethrown: turning a budget failure or an uninitialised
+   * registry into a null would make an outage look like an anchor that has
+   * nothing to report.
+   */
+  async getMeta(domain: string): Promise<AnchorMetadata | null> {
+    let raw: RawMeta;
+    try {
+      raw = await this.read<RawMeta>("get_meta", nativeToScValString(domain));
+    } catch (e) {
+      if (contractErrorCode(e) === RegistryContractError.NotFound) return null;
+      throw e;
+    }
+    return {
+      domain: raw.domain,
+      receiveAssets: raw.receive_assets,
+      ...metaCountry(raw),
+      attestedLedger: raw.attested_ledger,
+      attester: raw.attester,
+    };
+  }
+
+  /**
+   * Whether the anchor was OBSERVED receiving `code` at its last attestation.
+   *
+   * This is the registry answering a lane question rather than a capability
+   * question: `servesSep31` says the endpoint works, this says what comes out
+   * of it. `false` for a domain with no metadata — the contract reports the
+   * absence as `NotFound`, and "not recorded" is not "not supported", so the
+   * distinction belongs to `getMeta`, which can return null.
+   */
+  async receivesAsset(domain: string, code: string): Promise<boolean> {
+    return this.read<boolean>(
+      "receives_asset",
+      nativeToScValString(domain),
+      nativeToScValString(code),
+    );
   }
 
   /** SHA-256 of the stellar.toml the latest attestation was made from. */

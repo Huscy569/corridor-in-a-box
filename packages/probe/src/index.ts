@@ -15,11 +15,14 @@
 // `fetchImpl` is injectable so the whole thing is testable without a network.
 
 import { Keypair, TransactionBuilder, type Transaction } from "@stellar/stellar-sdk";
+import { declaredCountry } from "./country";
 import { tomlHash as tomlHashText } from "./toml-hash";
 import { isSafeUrl } from "./url-safety";
 
 export { tomlHash } from "./toml-hash";
 export { isSafeUrl } from "./url-safety";
+export { isCanonicalDomain, MAX_DOMAIN_LEN } from "./domain";
+export { declaredCountry, toAlpha2 } from "./country";
 export { renderSweepMarkdown, renderSweepJson, isUsableSep31OffRamp } from "./report";
 export {
   ANCHOR_KINDS,
@@ -77,7 +80,18 @@ export interface ProbeResult {
   /** Per-probe detail, in the order probes were attempted. */
   readonly outcomes: readonly ProbeOutcome[];
   /** Receive assets accepted by the anchor if SEP-31 probe passed. */
+  readonly sep31ReceiveAssets?: readonly string[];
+  /** Receive assets accepted by the anchor if SEP-31 probe passed. Kept for backwards compatibility. */
   readonly receiveAssets?: readonly string[];
+  /**
+   * DECLARED, not verified: the ISO-3166-1 alpha-2 country the anchor gives in
+   * its own `stellar.toml` under `[DOCUMENTATION] ORG_PHYSICAL_ADDRESS`.
+   *
+   * Absent when the toml declares no country in a form that maps to a code without
+   * a judgement call. That is not "this anchor has no country" — it is "we could
+   * not read one", and on chain the difference is `None` rather than a value.
+   */
+  readonly country?: string;
   /** Raw text of stellar.toml if successfully fetched. */
   readonly toml?: string;
 }
@@ -179,6 +193,10 @@ export async function probeAnchor(
     }
   }
 
+  // Declared, straight from the toml we just hashed — no endpoint is involved,
+  // so this is read whether or not any probe past SEP-1 gets a chance to run.
+  const country = declaredCountry(toml);
+
   // --- SEP-10: a full handshake, not a reachability check ----------------
   let token: string | undefined;
   const webAuth = endpoint.get(10);
@@ -268,7 +286,7 @@ export async function probeAnchor(
   }
 
   // --- SEP-31: does it receive anything? ---------------------------------
-  let receiveAssets: string[] | undefined;
+  let sep31ReceiveAssets: string[] | undefined;
   const sep31 = endpoint.get(31);
   if (sep31) {
     try {
@@ -281,7 +299,7 @@ export async function probeAnchor(
         // exists, the lane does not.
         throw new Error("receive list is EMPTY — advertises SEP-31 but accepts nothing");
       }
-      receiveAssets = assets;
+      sep31ReceiveAssets = assets;
       record("sep31_info", true, `receives ${assets.join(", ")}`);
     } catch (e) {
       record("sep31_info", false, why(e));
@@ -342,7 +360,8 @@ export async function probeAnchor(
     tomlHash,
     outcomes,
     toml,
-    ...(receiveAssets ? { receiveAssets } : {}),
+    ...(sep31ReceiveAssets ? { sep31ReceiveAssets, receiveAssets: sep31ReceiveAssets } : {}),
+    ...(country ? { country } : {}),
   };
 }
 
@@ -353,6 +372,8 @@ export interface FormattedProbeResultJson {
   readonly seps: readonly SepNumber[];
   readonly probesPassed: readonly ProbeName[];
   readonly probesRun: readonly ProbeName[];
+  readonly sep31ReceiveAssets?: readonly string[];
+  readonly receiveAssets?: readonly string[];
   readonly raw: {
     readonly seps: number;
     readonly probesRun: number;

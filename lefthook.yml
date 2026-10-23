@@ -19,7 +19,7 @@ pre-commit:
         if command -v gitleaks > /dev/null 2>&1; then
           gitleaks git --staged --pre-commit --redact --no-banner -c .gitleaks.toml
         else
-          echo "warning: gitleaks not installed, skipping secret scan. See https://github.com/gitleaks/gitleaks#installation"
+          echo 'warning: gitleaks not installed, skipping secret scan. See https://github.com/gitleaks/gitleaks#installation'
         fi
     cargofmt:
       glob: "contracts/**/*.rs"

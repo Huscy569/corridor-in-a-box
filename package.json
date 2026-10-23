@@ -23,11 +23,13 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
+    "test:quarantine": "vitest run --mode quarantine",
     "lint": "eslint . && prettier --check .",
     "format": "prettier --write .",
     "prepare": "lefthook install",
     "cli": "tsx packages/cli/src/index.ts",
     "example": "tsx examples/run-payment.ts",
+    "example:stub": "tsx examples/run-stub-adapter.ts",
     "testnet": "tsx examples/run-testnet.ts",
     "serve": "tsx examples/run-service.ts",
     "verify:settle": "tsx examples/verify-settle-leg.ts",
@@ -39,6 +41,7 @@
     "registry:staleness": "tsx examples/check-staleness.ts",
     "registry:history": "tsx examples/registry-history.ts",
     "attest": "tsx examples/attest.ts",
+    "gen:web-data": "tsx scripts/gen-web-data.ts",
     "sweep:anchors": "tsx examples/sweep-anchors.ts"
   },
   "dependencies": {
@@ -60,15 +63,16 @@
     "@stellar/stellar-sdk": "^17.2.1",
     "@types/node": "^26.6.4",
     "@types/pg": "^8.23.1",
-    "eslint": "^10.12.0",
+    "eslint": "^10.13.0",
     "eslint-config-prettier": "^10.1.8",
-    "lefthook": "2.1.15",
+    "lefthook": "2.2.2",
     "pg": "^8.23.1",
-    "prettier": "^3.9.9",
-    "tsx": "^4.23.13",
+    "prettier": "^3.9.10",
+    "tsx": "^4.23.15",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.71.1",
-    "vitest": "^2.1.0"
+    "vitest": "^2.1.0",
+    "parse-prometheus-text-format": "^1.1.1"
   },
   "packageManager": "pnpm@9.12.0"
 }

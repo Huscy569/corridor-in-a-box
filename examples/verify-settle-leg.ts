@@ -81,6 +81,11 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  if (res.value.kind !== "stellar") {
+    console.error(`Unexpected settlement kind: ${res.value.kind}`);
+    process.exit(1);
+  }
+
   const { stellarTxHash, ledger } = res.value;
   console.log("✓ settled on testnet");
   console.log(`  tx hash: ${stellarTxHash}`);

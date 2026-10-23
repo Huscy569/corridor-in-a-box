@@ -216,7 +216,7 @@ export function createRegistryRouteResolver(
     });
   } else {
     attestationSource = {
-      async servesSep31(_d: string): Promise<boolean> {
+      async serves(_d: string, _p: "sep31" | "sep6"): Promise<boolean> {
         throw new Error(
           `no registry deployed on ${network} (see contracts/deployments.json or set REGISTRY_CONTRACT_ID)`,
         );

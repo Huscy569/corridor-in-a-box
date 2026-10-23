@@ -1,0 +1,357 @@
+[
+  {
+    "id": "reference-testnet",
+    "source": {
+      "name": "Local Sending Anchor",
+      "asset": "USDC",
+      "protocol": "prefunded",
+      "endpoints": {
+        "home_domain": "localhost:8080"
+      }
+    },
+    "dest": {
+      "name": "Anchor Platform Reference",
+      "asset": "iso4217:USD",
+      "protocol": "sep31",
+      "endpoints": {
+        "home_domain": "localhost:8080",
+        "transfer_server_sep31": "http://localhost:8080/sep31",
+        "web_auth": "http://localhost:8080/auth",
+        "kyc_server": "http://localhost:8080/sep12",
+        "quote_server": "http://localhost:8080/sep38"
+      }
+    },
+    "fx": {
+      "path": [
+        "USD",
+        "USDC",
+        "USD"
+      ],
+      "quote_source": "sep38",
+      "who_holds_risk": "receiving_anchor",
+      "quote_ttl_seconds": 60,
+      "min_quote_remaining_seconds": 45
+    },
+    "compliance": {
+      "source_jurisdiction": "US",
+      "dest_jurisdiction": "US",
+      "travel_rule_profile": "default",
+      "sep12_receiver_type": "sep31-receiver",
+      "sep12_sender_type": "sep31-sender"
+    },
+    "settlement": {
+      "bridge_asset": "USDC",
+      "network": "testnet",
+      "asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+    },
+    "recovery": {
+      "max_retries": 3,
+      "timeout_seconds": 900,
+      "refund_wait_seconds": 86400,
+      "rollback": "refund_sender",
+      "reconcile": {
+        "external_stall_seconds": 21600
+      },
+      "breaker": {
+        "consecutive_failures": 3
+      }
+    }
+  },
+  {
+    "id": "mx-example",
+    "status_note": "TEMPLATE — endpoints are fictional placeholders. No anchor relationship exists. Not runnable.",
+    "source": {
+      "name": "USD Sending Anchor",
+      "asset": "USDC",
+      "protocol": "prefunded",
+      "endpoints": {
+        "home_domain": "sending-anchor.example"
+      }
+    },
+    "dest": {
+      "name": "Mexico Off-Ramp (example — not a real anchor)",
+      "asset": "iso4217:MXN",
+      "protocol": "sep31",
+      "endpoints": {
+        "home_domain": "anchor.example.mx",
+        "transfer_server_sep31": "https://anchor.example.mx/sep31",
+        "web_auth": "https://anchor.example.mx/auth",
+        "kyc_server": "https://anchor.example.mx/sep12",
+        "quote_server": "https://anchor.example.mx/sep38"
+      }
+    },
+    "fx": {
+      "path": [
+        "USD",
+        "USDC",
+        "MXN"
+      ],
+      "quote_source": "sep38",
+      "who_holds_risk": "receiving_anchor",
+      "quote_ttl_seconds": 60,
+      "min_quote_remaining_seconds": 45
+    },
+    "compliance": {
+      "source_jurisdiction": "US",
+      "dest_jurisdiction": "MX",
+      "travel_rule_profile": "default",
+      "sep12_receiver_type": "sep31-receiver",
+      "sep12_sender_type": "sep31-sender"
+    },
+    "settlement": {
+      "bridge_asset": "USDC",
+      "network": "public",
+      "asset_issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+    },
+    "recovery": {
+      "max_retries": 3,
+      "timeout_seconds": 900,
+      "refund_wait_seconds": 86400,
+      "rollback": "refund_sender",
+      "reconcile": {
+        "external_stall_seconds": 21600
+      },
+      "breaker": {
+        "consecutive_failures": 3
+      }
+    }
+  },
+  {
+    "id": "ng-cn",
+    "status_note": "PENDING — no compliant RMB SEP-31 off-ramp exists yet (checked 2026-10-18: no directory anchor offers CNY/CNH/HKD payout or SEP-31 for CN/HK). dest endpoints unfilled.",
+    "source": {
+      "name": "Nigeria On-Ramp (e.g. cNGN/Cowrie-class)",
+      "asset": "USDC",
+      "protocol": "prefunded",
+      "endpoints": {
+        "home_domain": "example-ng-anchor.invalid"
+      }
+    },
+    "dest": {
+      "name": "China RMB Off-Ramp (does not exist yet)",
+      "asset": "iso4217:CNY",
+      "protocol": "sep31",
+      "endpoints": {
+        "home_domain": "example-cn-anchor.invalid"
+      }
+    },
+    "fx": {
+      "path": [
+        "NGN",
+        "USDC",
+        "CNY"
+      ],
+      "quote_source": "sep38",
+      "who_holds_risk": "sending_anchor",
+      "quote_ttl_seconds": 45,
+      "min_quote_remaining_seconds": 15
+    },
+    "compliance": {
+      "source_jurisdiction": "NG",
+      "dest_jurisdiction": "CN",
+      "travel_rule_profile": "strict",
+      "sep12_receiver_type": "sep31-receiver",
+      "sep12_sender_type": "sep31-sender"
+    },
+    "settlement": {
+      "bridge_asset": "USDC",
+      "network": "public",
+      "asset_issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+    },
+    "recovery": {
+      "max_retries": 2,
+      "timeout_seconds": 1200,
+      "refund_wait_seconds": 86400,
+      "rollback": "refund_sender",
+      "reconcile": {
+        "external_stall_seconds": 21600
+      },
+      "breaker": {
+        "consecutive_failures": 3
+      }
+    }
+  },
+  {
+    "id": "ng-cowrie",
+    "status_note": "REAL — Cowrie Exchange (Lagos, Nigeria), confirmed 2026-10-17. No SEP-38, no payment attempted, no business relationship in place.",
+    "source": {
+      "name": "USD Sending Anchor",
+      "asset": "USDC",
+      "protocol": "prefunded",
+      "endpoints": {
+        "home_domain": "sending-anchor.example"
+      }
+    },
+    "dest": {
+      "name": "Cowrie Exchange (Nigeria)",
+      "asset": "iso4217:NGN",
+      "protocol": "sep31",
+      "endpoints": {
+        "home_domain": "cowrie.exchange",
+        "transfer_server_sep31": "https://api.cowrie.exchange/sep31/direct",
+        "web_auth": "https://api.cowrie.exchange/web_auth",
+        "kyc_server": "https://api.cowrie.exchange/kyc",
+        "endpoints_verified_at": "2026-10-17"
+      }
+    },
+    "fx": {
+      "path": [
+        "USD",
+        "USDC",
+        "NGN"
+      ],
+      "quote_source": "external",
+      "who_holds_risk": "receiving_anchor",
+      "quote_ttl_seconds": 60,
+      "min_quote_remaining_seconds": 45
+    },
+    "compliance": {
+      "source_jurisdiction": "US",
+      "dest_jurisdiction": "NG",
+      "travel_rule_profile": "default",
+      "sep12_receiver_type": "sep31-receiver",
+      "sep12_sender_type": "sep31-sender"
+    },
+    "settlement": {
+      "bridge_asset": "USDC",
+      "network": "public",
+      "asset_issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+    },
+    "recovery": {
+      "max_retries": 3,
+      "timeout_seconds": 900,
+      "refund_wait_seconds": 86400,
+      "rollback": "refund_sender",
+      "reconcile": {
+        "external_stall_seconds": 21600
+      },
+      "breaker": {
+        "consecutive_failures": 3
+      }
+    }
+  },
+  {
+    "id": "testanchor-sep6",
+    "status_note": "SDF Test Anchor (testanchor.stellar.org) on testnet via SEP-6. Endpoints read from its stellar.toml 2026-10-17. No payment attempted. liveness() does not yet understand SEP-6 endpoints, so plan reports NOT runnable.",
+    "source": {
+      "name": "Testnet Sending Anchor",
+      "asset": "USDC",
+      "protocol": "prefunded",
+      "endpoints": {
+        "home_domain": "sending-anchor.example"
+      }
+    },
+    "dest": {
+      "name": "SDF Test Anchor (testnet)",
+      "asset": "iso4217:USD",
+      "protocol": "sep6",
+      "endpoints": {
+        "home_domain": "testanchor.stellar.org",
+        "transfer_server": "https://testanchor.stellar.org/sep6",
+        "web_auth": "https://testanchor.stellar.org/auth",
+        "kyc_server": "https://testanchor.stellar.org/sep12",
+        "quote_server": "https://testanchor.stellar.org/sep38",
+        "endpoints_verified_at": "2026-10-17"
+      }
+    },
+    "fx": {
+      "path": [
+        "USD",
+        "USDC",
+        "USD"
+      ],
+      "quote_source": "sep38",
+      "who_holds_risk": "receiving_anchor",
+      "quote_ttl_seconds": 60,
+      "min_quote_remaining_seconds": 45
+    },
+    "compliance": {
+      "source_jurisdiction": "US",
+      "dest_jurisdiction": "US",
+      "travel_rule_profile": "default",
+      "sep12_receiver_type": "sep31-receiver",
+      "sep12_sender_type": "sep31-sender"
+    },
+    "settlement": {
+      "bridge_asset": "USDC",
+      "network": "testnet",
+      "asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+    },
+    "recovery": {
+      "max_retries": 3,
+      "timeout_seconds": 900,
+      "refund_wait_seconds": 86400,
+      "rollback": "refund_sender",
+      "reconcile": {
+        "external_stall_seconds": 21600
+      },
+      "breaker": {
+        "consecutive_failures": 3
+      }
+    }
+  },
+  {
+    "id": "zeam",
+    "status_note": "REAL — Zeam (mint.zeam.money), probed 2026-10-17: SEP-10/12/31/38 all answer. No payment attempted, no business relationship in place.",
+    "source": {
+      "name": "USD Sending Anchor",
+      "asset": "USDC",
+      "protocol": "prefunded",
+      "endpoints": {
+        "home_domain": "sending-anchor.example"
+      }
+    },
+    "dest": {
+      "name": "Zeam (South Africa)",
+      "asset": "iso4217:ZAR",
+      "protocol": "sep31",
+      "endpoints": {
+        "home_domain": "mint.zeam.money",
+        "transfer_server_sep31": "https://anchor.zeam.money/sep31",
+        "web_auth": "https://anchor.zeam.money/auth",
+        "kyc_server": "https://anchor.zeam.money/customer",
+        "quote_server": "https://anchor.zeam.money/sep38",
+        "endpoints_verified_at": "2026-10-17"
+      }
+    },
+    "fx": {
+      "path": [
+        "USD",
+        "USDC",
+        "ZAR"
+      ],
+      "quote_source": "sep38",
+      "who_holds_risk": "receiving_anchor",
+      "quote_ttl_seconds": 60,
+      "min_quote_remaining_seconds": 45
+    },
+    "compliance": {
+      "source_jurisdiction": "US",
+      "dest_jurisdiction": "ZA",
+      "travel_rule_profile": "default",
+      "sep12_receiver_type": "sep31-receiver",
+      "sep12_sender_type": "sep31-sender"
+    },
+    "settlement": {
+      "bridge_asset": "USDC",
+      "network": "public",
+      "asset_issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+    },
+    "recovery": {
+      "max_retries": 3,
+      "timeout_seconds": 900,
+      "refund_wait_seconds": 86400,
+      "rollback": "refund_sender",
+      "reconcile": {
+        "external_stall_seconds": 21600
+      },
+      "breaker": {
+        "consecutive_failures": 3
+      }
+    },
+    "limits": {
+      "min_amount": "1",
+      "max_amount": "10000"
+    }
+  }
+]

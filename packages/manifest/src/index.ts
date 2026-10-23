@@ -59,8 +59,8 @@ const AnchorBaseSchema = z.object({
 
 export const AnchorSchema = AnchorBaseSchema.extend({ endpoints: AnchorEndpointsSchema });
 
-// `transfer_server_sep31` stays optional so an incomplete manifest still
-// parses; `liveness()` reports a SEP-31 dest without it as NOT runnable.
+// Required protocol endpoints stay in their protocol schemas; `liveness()` also
+// checks them so incomplete destination manifests can report NOT runnable.
 const Sep31DestSchema = AnchorBaseSchema.extend({
   protocol: z.literal("sep31").default("sep31"),
   endpoints: AnchorEndpointsSchema,

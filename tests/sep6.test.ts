@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { parseCorridor, type Corridor } from "@corridor/manifest";
-import type { Quote } from "@corridor/adapter-kit";
+import { conformanceSuite, runConformance, type Quote } from "@corridor/adapter-kit";
 import { mapSep6Status, Sep6Adapter, type Sep10Signer } from "@corridor/sep6";
 import { StaticRouteResolver } from "@corridor/router";
 import {
@@ -11,6 +11,8 @@ import {
   type EngineDeps,
 } from "@corridor/engine";
 import type { PaymentIntent } from "@corridor/types";
+import { createMockSep6Anchor } from "./fixtures/mock-sep6-anchor";
+import { expectConformance } from "./helpers/conformance";
 
 const PASSPHRASE = "Test SDF Network ; September 2015";
 const TRANSFER = "https://d.example/sep6";
@@ -37,9 +39,8 @@ function corridor(
     },
     fx: { path: ["ARS", "USDC", "ARS"], who_holds_risk: "receiving_anchor" },
     compliance: { source_jurisdiction: "AR", dest_jurisdiction: "AR" },
-    // testnet, not public: `liveness()` only knows SEP-31's
-    // `transfer_server_sep31`, so a SEP-6 dest reads as "not-runnable" and the
-    // engine refuses it outright on the public network.
+    // testnet, not public: this fixture exercises the SEP-6 lane without live
+    // network settlement.
     settlement: { network: "testnet", asset_issuer: "GISSUER", ...settlement },
     recovery: {},
   });
@@ -1084,5 +1085,247 @@ describe("engine end-to-end: a SEP-6 withdrawal settles over StellarPaymentStrat
     expect(req.memo).toBe("aGVsbG8=");
     expect(req.memoType).toBe("hash");
     expect(req.amount).toEqual({ asset: "USDC", amount: "5.00" });
+  });
+});
+
+describe("scripted mock SEP-6 anchor (mock-sep6-anchor) and conformance (#200)", () => {
+  const fullEndpoints = {
+    web_auth: "https://d.example/auth",
+    quote_server: "https://d.example/sep38",
+    kyc_server: "https://d.example/sep12",
+  };
+
+  const mockSigner: Sep10Signer = {
+    account: "GSIGNER",
+    signChallenge: async (xdr) => `signed(${xdr})`,
+  };
+
+  it("walks a multi-step scripted status progression from created to completed", async () => {
+    const mock = createMockSep6Anchor({
+      statuses: [
+        "pending_user_transfer_start",
+        "pending_anchor",
+        "pending_external",
+        "completed",
+      ],
+      anchorAccount: "GMOCKSEP6DEPOSIT",
+      memo: "aGVsbG8=",
+      memoType: "hash",
+    });
+
+    const c = corridor(fullEndpoints);
+    const adapter = new Sep6Adapter(c, { fetchImpl: mock.fetchImpl, sep10: mockSigner });
+
+    const infoRes = await adapter.info();
+    expect(infoRes.ok).toBe(true);
+    if (infoRes.ok) {
+      expect(infoRes.value.withdrawExchange.ARS?.enabled).toBe(true);
+    }
+
+    const submitter = createMockSubmitter();
+    let nowMs = 1_700_000_000_000;
+    const deps: EngineDeps = {
+      resolver: new StaticRouteResolver(() => adapter, {
+        trustManifestWithoutAttestation: true,
+      }),
+      submitter,
+      strategies: [new StellarPaymentStrategy(submitter)],
+      idempotency: new InMemoryIdempotencyStore(),
+      now: () => nowMs,
+      sleep: async (ms) => {
+        nowMs += ms;
+      },
+      reconcilePollMs: 100,
+      trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
+    };
+
+    const r = await execute(
+      {
+        ...intent,
+        idempotencyKey: "sep6-scripted-e2e",
+        destinationFields: { type: "bank_account", dest: "12345" },
+      },
+      c,
+      deps,
+    );
+
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.value.state).toBe("completed");
+    expect(r.value.trail).toEqual([
+      "created",
+      "quoted",
+      "compliant",
+      "opened",
+      "verifying",
+      "settling",
+      "settled",
+      "reconciled",
+      "completed",
+    ]);
+
+    const txPolls = mock.calls.filter((call) => call.url.includes("/transaction"));
+    expect(txPolls).toHaveLength(4);
+  });
+
+  it("routes terminal anchor `error` status into the recovery path (held / refunded)", async () => {
+    const mockHold = createMockSep6Anchor({
+      statuses: ["pending_anchor", "error"],
+    });
+    const baseCorridor = corridor(fullEndpoints);
+    const holdCorridor: Corridor = {
+      ...baseCorridor,
+      recovery: { ...baseCorridor.recovery, rollback: "hold" },
+    };
+    const holdAdapter = new Sep6Adapter(holdCorridor, {
+      fetchImpl: mockHold.fetchImpl,
+      sep10: mockSigner,
+    });
+    const holdStore = new InMemoryIdempotencyStore();
+    const holdSubmitter = createMockSubmitter();
+    let nowMs = 1_700_000_000_000;
+
+    const holdRes = await execute(
+      { ...intent, idempotencyKey: "sep6-error-hold" },
+      holdCorridor,
+      {
+        resolver: new StaticRouteResolver(() => holdAdapter, {
+          trustManifestWithoutAttestation: true,
+        }),
+        submitter: holdSubmitter,
+        strategies: [new StellarPaymentStrategy(holdSubmitter)],
+        idempotency: holdStore,
+        now: () => nowMs,
+        sleep: async (ms) => {
+          nowMs += ms;
+        },
+        reconcilePollMs: 50,
+        trustManifestWithoutAttestation: true,
+        unsafeSkipPreSettleGate: true,
+      },
+    );
+
+    expect(holdRes.ok).toBe(false);
+    if (!holdRes.ok) {
+      expect(holdRes.error.code).toBe("RECONCILE_MISMATCH");
+      expect(holdRes.error.message).toContain("status=error");
+    }
+    const storedHold = await holdStore.get("sep6-error-hold");
+    expect(storedHold?.state).toBe("held");
+
+    // Also verify refund_sender recovery when the anchor reports a full refund on `error`.
+    const mockRefund = createMockSep6Anchor({
+      statuses: ["pending_anchor", "error"],
+      refunds: {
+        amount_refunded: "5.00",
+        amount_fee: "0.00",
+        payments: [{ id: "stellar-ref-1", id_type: "stellar", amount: "5.00", fee: "0.00" }],
+      },
+    });
+    const refundCorridor: Corridor = {
+      ...baseCorridor,
+      recovery: { ...baseCorridor.recovery, rollback: "refund_sender" },
+    };
+    const refundAdapter = new Sep6Adapter(refundCorridor, {
+      fetchImpl: mockRefund.fetchImpl,
+      sep10: mockSigner,
+    });
+    const refundStore = new InMemoryIdempotencyStore();
+    const refundSubmitter = createMockSubmitter();
+
+    const refundRes = await execute(
+      { ...intent, idempotencyKey: "sep6-error-refund" },
+      refundCorridor,
+      {
+        resolver: new StaticRouteResolver(() => refundAdapter, {
+          trustManifestWithoutAttestation: true,
+        }),
+        submitter: refundSubmitter,
+        strategies: [new StellarPaymentStrategy(refundSubmitter)],
+        idempotency: refundStore,
+        now: () => nowMs,
+        sleep: async (ms) => {
+          nowMs += ms;
+        },
+        reconcilePollMs: 50,
+        trustManifestWithoutAttestation: true,
+        unsafeSkipPreSettleGate: true,
+      },
+    );
+
+    expect(refundRes.ok).toBe(false);
+    const storedRefund = await refundStore.get("sep6-error-refund");
+    expect(storedRefund?.state).toBe("refunded");
+    expect(storedRefund?.refundId).toBe("stellar-ref-1");
+  });
+
+  it("includes awaiting-input detail in the timeout message on pending_customer_info_update", async () => {
+    const mock = createMockSep6Anchor({
+      statuses: ["pending_customer_info_update"],
+    });
+    const baseCorridor = corridor(fullEndpoints);
+    const timeoutCorridor: Corridor = {
+      ...baseCorridor,
+      recovery: {
+        ...baseCorridor.recovery,
+        timeout_seconds: 10,
+        rollback: "hold",
+      },
+    };
+    const adapter = new Sep6Adapter(timeoutCorridor, {
+      fetchImpl: mock.fetchImpl,
+      sep10: mockSigner,
+    });
+    const submitter = createMockSubmitter();
+    const store = new InMemoryIdempotencyStore();
+    let nowMs = 1_700_000_000_000;
+
+    const r = await execute(
+      { ...intent, idempotencyKey: "sep6-awaiting-input-timeout" },
+      timeoutCorridor,
+      {
+        resolver: new StaticRouteResolver(() => adapter, {
+          trustManifestWithoutAttestation: true,
+        }),
+        submitter,
+        strategies: [new StellarPaymentStrategy(submitter)],
+        idempotency: store,
+        now: () => nowMs,
+        sleep: async (ms) => {
+          nowMs += ms;
+        },
+        reconcilePollMs: 3_000,
+        stallThreshold: 0,
+        trustManifestWithoutAttestation: true,
+        unsafeSkipPreSettleGate: true,
+      },
+    );
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("SETTLEMENT_TIMEOUT");
+      expect(r.error.message).toContain("last status=pending_customer_info_update");
+      expect(r.error.message).toContain("awaiting input from another party");
+    }
+    const stored = await store.get("sep6-awaiting-input-timeout");
+    expect(stored?.state).toBe("held");
+  });
+
+  it("passes both conformanceSuite and runConformance against the mock SEP-6 anchor", async () => {
+    const mock = createMockSep6Anchor();
+    const c = corridor(fullEndpoints);
+    const adapter = new Sep6Adapter(c, { fetchImpl: mock.fetchImpl, sep10: mockSigner });
+
+    for (const probe of conformanceSuite(adapter, intent, c)) {
+      expect(await probe.run(), `probe failed: ${probe.name}`).toBe(true);
+    }
+
+    const report = await runConformance(
+      adapter,
+      { intent, corridor: c },
+      { allowNetworkWrites: true },
+    );
+    expectConformance(report);
   });
 });

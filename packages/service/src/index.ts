@@ -1,7 +1,9 @@
 // @corridor/service — a thin HTTP layer over the engine. The engine is a
 // library; this turns it into a service with the things a real endpoint needs:
-// JSON in/out, sensible HTTP status mapping, optional API-key auth, and a simple
-// in-memory rate limiter. Zero runtime dependencies — Node's built-in http.
+// JSON in/out, sensible HTTP status mapping, optional API-key auth, a simple
+// in-memory rate limiter, and a request id that comes back on the response and
+// goes into every log line and audit entry the request produced. Zero runtime
+// dependencies — Node's built-in http.
 //
 // The core is a pure `route()` you can unit-test without binding a socket;
 // `server()` is a thin node:http adapter around it.
@@ -128,6 +130,10 @@ export interface RouteResponse {
   /** Defaults to application/json (body is JSON-encoded). Set e.g. text/plain to
    *  send a string body verbatim (used by /metrics). */
   contentType?: string;
+  /** Response headers (lower-cased names) the transport merges into the reply.
+   *  `route()` always sets `x-request-id` here so a caller can correlate its own
+   *  logs with the lines the request produced. */
+  headers?: Record<string, string>;
 }
 
 export interface RouteRequest {
@@ -138,7 +144,62 @@ export interface RouteRequest {
   headers?: Record<string, string>;
   /** Resolved client IP from the transport (see `trustProxy`). Used for rate-limit keying. */
   clientIp?: string;
+  /**
+   * Request id already assigned by the transport, so `server()` can answer its
+   * own error paths (413, invalid JSON, the 500 catch) with the same id the
+   * route will log under. Ignored when absent: `route()` then takes
+   * `x-request-id` from the headers, or mints one.
+   */
+  requestId?: string;
+  /** Validated W3C `traceparent` resolved by the transport. Same fallback rule. */
+  traceparent?: string;
 }
+
+/**
+ * An inbound request id is echoed only if it looks like one: bounded so it can
+ * go into a log field or a Postgres column without surprises, and restricted to
+ * a charset that cannot inject a header line break or smuggle markup into a log
+ * shipper. Anything else is replaced, never rejected — refusing a request over
+ * its own correlation id is a bad trade.
+ */
+const REQUEST_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+
+/**
+ * W3C traceparent, exactly: `version-trace-id-parent-id-flags`. Accepted so the
+ * id survives into logs and audit entries; full tracing (spans, sampling,
+ * export) belongs to the OTel integration, not to this thin layer.
+ */
+const TRACEPARENT_PATTERN = /^[0-9a-fA-F]{2}-[0-9a-fA-F]{32}-[0-9a-fA-F]{16}-[0-9a-fA-F]{2}$/;
+
+/** Echo a well-formed inbound id, or mint a fresh one. Never throws. */
+const resolveRequestId = (inbound: string | undefined): string =>
+  inbound && REQUEST_ID_PATTERN.test(inbound) ? inbound : crypto.randomUUID();
+
+/** Pass a well-formed traceparent through; drop anything else. */
+const resolveTraceparent = (inbound: string | undefined): string | undefined =>
+  inbound && TRACEPARENT_PATTERN.test(inbound) ? inbound : undefined;
+
+/** The per-request correlation ids every response echoes and every log line carries. */
+interface RequestContext {
+  readonly requestId: string;
+  readonly traceparent?: string;
+}
+
+const requestHeaders = (ctx: RequestContext): Record<string, string> => ({
+  "x-request-id": ctx.requestId,
+  ...(ctx.traceparent ? { traceparent: ctx.traceparent } : {}),
+});
+
+/**
+ * Resolve the request context: what the transport already decided wins, then the
+ * inbound headers, then a freshly minted uuid.
+ */
+const contextOf = (req: RouteRequest): RequestContext => {
+  const headers = req.headers ?? {};
+  const requestId = resolveRequestId(req.requestId ?? headers["x-request-id"]);
+  const traceparent = resolveTraceparent(req.traceparent ?? headers["traceparent"]);
+  return { requestId, ...(traceparent ? { traceparent } : {}) };
+};
 
 const STATUS_BY_CODE: Record<CorridorErrorCode, number> = {
   MANIFEST_INVALID: 422,
@@ -578,9 +639,17 @@ export function createService(options: ServiceOptions): Service {
   }
 
   async function route(req: RouteRequest): Promise<RouteResponse> {
-    const { path, method } = req;
-    const url = new URL(path, "http://localhost");
-    const pathname = url.pathname;
+    // The id is resolved here, before anything else, so even a request that
+    // never reaches a handler (unknown path, 401) comes back with the same id
+    // its own log lines were written under.
+    const ctx = contextOf(req);
+    const out = await handle(req, ctx);
+    return { ...out, headers: { ...(out.headers ?? {}), ...requestHeaders(ctx) } };
+  }
+
+  async function handle(req: RouteRequest, ctx: RequestContext): Promise<RouteResponse> {
+    const headers = req.headers ?? {};
+    const path = req.path.replace(/\/+$/, "") || "/";
 
     // Health is public and unmetered. Always 200 — liveness only.
     if (req.method === "GET" && path === "/healthz") {
@@ -703,7 +772,13 @@ export function createService(options: ServiceOptions): Service {
       }
       // Owner comes from the VALIDATED bearer, never from the body — a client
       // must not be able to claim another tenant's runs by asking.
-      const p = execute(intent, corridor, options.deps, { owner: presentedKey });
+      // The request id travels with it: every log line and audit entry the run
+      // produces is stamped with the same id this response echoes.
+      const p = execute(intent, corridor, options.deps, {
+        owner: presentedKey,
+        requestId: ctx.requestId,
+        ...(ctx.traceparent ? { traceparent: ctx.traceparent } : {}),
+      });
       trackExecution(intent.idempotencyKey, p);
       const result = await p;
       if (result.ok) {
@@ -799,58 +874,98 @@ export function createService(options: ServiceOptions): Service {
     return { status: 404, body: { error: "NOT_FOUND" } };
   }
 
-  function server(): ReturnType<typeof httpCreateServer> {
-    const maxBody = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
-    return httpCreateServer((async (req: IncomingMessage, res: ServerResponse) => {
-      try {
-        const chunks: Buffer[] = [];
-        let size = 0;
-        for await (const chunk of req) {
-          size += chunk.length;
-          if (size > maxBody) {
-            res.writeHead(413, { "content-type": "application/json" });
-            res.end(JSON.stringify({ error: "PAYLOAD_TOO_LARGE" }));
-            req.resume();
-            return;
-          }
-          chunks.push(chunk as Buffer);
-        }
-        const rawBody = Buffer.concat(chunks).toString("utf8");
-        let body: unknown = undefined;
-        if (rawBody) {
-          try {
-            body = JSON.parse(rawBody);
-          } catch {
-            resParseError(res, 400, "BAD_JSON");
-            return;
-          }
-        }
-        const headers: Record<string, string> = {};
-        for (const [k, v] of Object.entries(req.headers)) {
-          if (typeof v === "string") headers[k] = v;
-          else if (Array.isArray(v)) headers[k] = v.join(",");
-        }
-        const clientIp = options.trustProxy
-          ? (headers["x-forwarded-for"] ?? "").split(",")[0].trim() || req.socket.remoteAddress
-          : req.socket.remoteAddress;
-        const out = await route({
-          method: req.method ?? "GET",
-          path: req.url ?? "/",
-          body,
-          rawBody,
-          headers,
-          clientIp,
-        });
-        const payload =
-          out.contentType ? (out.body as string) : JSON.stringify(out.body);
-        res.writeHead(out.status, {
-          "content-type": out.contentType ?? "application/json",
-        });
-        res.end(payload);
-      } catch (e) {
-        resParseError(res, 500, "INTERNAL_ERROR");
+  const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+
+  function server() {
+    return httpCreateServer((incoming: IncomingMessage, res: ServerResponse) => {
+      // Headers first, before a single body byte: the transport's own failure
+      // paths (413, invalid JSON, the 500 catch) must answer with the same
+      // request id the rest of the system logs under.
+      const headers = flattenHeaders(incoming.headers);
+      const ctx = contextOf({ method: incoming.method ?? "GET", path: "/", headers });
+
+      const sendJson = (status: number, body: unknown) => {
+        res.writeHead(status, { "content-type": "application/json", ...requestHeaders(ctx) });
+        res.end(JSON.stringify(body));
+      };
+
+      // Reject oversized bodies up front when the client declares Content-Length,
+      // before reading a single byte.
+      const declared = Number(incoming.headers["content-length"]);
+      if (Number.isFinite(declared) && declared > maxBodyBytes) {
+        sendJson(413, { error: "payload too large" });
+        incoming.destroy();
+        return;
       }
-    }) as (...args: unknown[]) => void);
+
+      const chunks: Buffer[] = [];
+      let size = 0;
+      let aborted = false;
+      incoming.on("data", (c: Buffer) => {
+        if (aborted) return;
+        size += c.length;
+        // Guard against a lying/absent Content-Length: cap the actual bytes read
+        // so a stream can't exhaust memory.
+        if (size > maxBodyBytes) {
+          aborted = true;
+          sendJson(413, { error: "payload too large" });
+          incoming.destroy();
+          return;
+        }
+        chunks.push(c);
+      });
+      incoming.on("end", async () => {
+        if (aborted) return;
+        const raw = Buffer.concat(chunks).toString("utf8");
+        let body: unknown = undefined;
+        if (raw) {
+          try {
+            body = JSON.parse(raw);
+          } catch {
+            sendJson(400, { error: "invalid JSON" });
+            return;
+          }
+        }
+        const url = new URL(incoming.url ?? "/", "http://localhost");
+        try {
+          const out = await route({
+            method: incoming.method ?? "GET",
+            path: url.pathname,
+            body,
+            rawBody: raw,
+            headers,
+            clientIp: resolveClientIp(incoming, headers, options.trustProxy ?? false),
+            requestId: ctx.requestId,
+            ...(ctx.traceparent ? { traceparent: ctx.traceparent } : {}),
+          });
+          res.writeHead(out.status, {
+            "content-type": out.contentType ?? "application/json",
+            ...(out.headers ?? {}),
+          });
+          // Only a route that chose its own content type may send a string body
+          // verbatim; a JSON response stays JSON, quotes and all.
+          res.end(
+            out.contentType !== undefined && typeof out.body === "string"
+              ? out.body
+              : JSON.stringify(out.body),
+          );
+        } catch {
+          // An unexpected throw (e.g. the idempotency DB is unreachable) must not
+          // hang the socket or crash the process. A throw here means no payment
+          // was committed past its last persisted state, so the run is safe to
+          // retry; surface a 500 and let the caller back off. Settlement-time
+          // store failures degrade to the same `settling`/IDEMPOTENCY_CONFLICT
+          // path as a crash — never a silent double-settle.
+          if (!res.headersSent) {
+            res.writeHead(500, {
+              "content-type": "application/json",
+              ...requestHeaders(ctx),
+            });
+            res.end(JSON.stringify({ error: "internal", message: "unexpected error" }));
+          }
+        }
+      });
+    });
   }
 
   return { route, server, drain, inFlightKeys: () => [...inFlight.keys()] };
@@ -865,6 +980,19 @@ function resParseError(res: ServerResponse, status: number, code: string): void 
 function bearer(headers: Record<string, string> | undefined): string | undefined {
   const auth = headers?.["authorization"];
   return auth?.startsWith("Bearer ") ? auth.slice(7) : undefined;
+}
+
+/**
+ * Lower-case the incoming headers into the flat `Record<string, string>` the
+ * router reads. Repeated headers arrive as arrays and are dropped rather than
+ * guessed at — a route must never see a value the peer didn't send unambiguously.
+ */
+function flattenHeaders(raw: IncomingMessage["headers"]): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof v === "string") headers[k.toLowerCase()] = v;
+  }
+  return headers;
 }
 
 /** `Set.has()` short-circuits on hash-bucket lookup, which leaks timing

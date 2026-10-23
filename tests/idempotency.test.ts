@@ -319,14 +319,16 @@ function fakeDb(): Queryable & { table: Map<string, Record<string, unknown>> } {
         quote_firm: params[7],
         settlement_amount: params[8],
         stellar_tx_hash: params[9],
-        deposit_address: params[10],
-        memo: params[11],
-        memo_type: params[12],
-        refund_id: params[13],
-        last_error: params[14],
-        owner: params[15],
-        settlement: params[16],
-        manifest_hash: params[17],
+        settlement_kind: params[10],
+        settlement_ref: params[11],
+        deposit_address: params[12],
+        memo: params[13],
+        memo_type: params[14],
+        refund_id: params[15],
+        last_error: params[16],
+        owner: params[17],
+        settlement: params[18],
+        manifest_hash: params[19],
       };
       // create(): INSERT … ON CONFLICT DO NOTHING RETURNING — only the first
       // writer for a key lands a row and gets it back; a conflict returns [].
@@ -342,6 +344,8 @@ function fakeDb(): Queryable & { table: Map<string, Record<string, unknown>> } {
       if (!current || (current.version as number) < incoming.version) {
         table.set(key, {
           ...incoming,
+          settlement_kind: incoming.settlement_kind ?? current?.settlement_kind,
+          settlement_ref: incoming.settlement_ref ?? current?.settlement_ref,
           refund_id: current?.refund_id ?? incoming.refund_id,
           manifest_hash: current?.manifest_hash ?? incoming.manifest_hash,
         });
@@ -491,6 +495,8 @@ describe("refund state round-trips", () => {
       "settlement_amount",
       "deposit_address",
       "manifest_hash",
+      "settlement_kind",
+      "settlement_ref",
     ]) {
       expect(seen[0]).toContain(column);
       expect(seen.slice(1).join("\n")).toContain(`add column if not exists ${column}`);
@@ -581,5 +587,81 @@ describe("PostgresIdempotencyStore", () => {
     expect(got?.manifestHash).toBe(
       "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234",
     );
+  });
+
+  it("round-trips settlementKind and settlementRef for both adapter and stellar", async () => {
+    const memoryStore = new InMemoryIdempotencyStore();
+    const db = fakeDb();
+    const pgStore = new PostgresIdempotencyStore(db);
+
+    for (const store of [memoryStore, pgStore]) {
+      // Adapter settlement
+      await store.put({
+        idempotencyKey: "run-adapter",
+        corridorId: "c",
+        state: "settled",
+        version: 2,
+        settlementKind: "adapter",
+        settlementRef: {
+          kind: "adapter",
+          reference: "otc_998877",
+          reportedAt: 1700000000000,
+        },
+      });
+      const adapterRun = await store.get("run-adapter");
+      expect(adapterRun?.settlementKind).toBe("adapter");
+      expect(adapterRun?.settlementRef).toEqual({
+        kind: "adapter",
+        reference: "otc_998877",
+        reportedAt: 1700000000000,
+      });
+      expect(adapterRun?.stellarTxHash).toBeUndefined();
+
+      // Stellar settlement
+      await store.put({
+        idempotencyKey: "run-stellar",
+        corridorId: "c",
+        state: "settled",
+        version: 2,
+        stellarTxHash: "tx_hash_stellar_123",
+        settlementKind: "stellar",
+        settlementRef: {
+          kind: "stellar",
+          stellarTxHash: "tx_hash_stellar_123",
+          ledger: 54321,
+        },
+      });
+      const stellarRun = await store.get("run-stellar");
+      expect(stellarRun?.settlementKind).toBe("stellar");
+      expect(stellarRun?.stellarTxHash).toBe("tx_hash_stellar_123");
+      expect(stellarRun?.settlementRef).toEqual({
+        kind: "stellar",
+        stellarTxHash: "tx_hash_stellar_123",
+        ledger: 54321,
+      });
+    }
+  });
+
+  it("maps legacy Postgres row with only stellar_tx_hash to stellar SettlementRef", async () => {
+    const db = fakeDb();
+    const store = new PostgresIdempotencyStore(db);
+    // Simulate pre-existing row in database with no settlement_kind or settlement_ref columns
+    db.table.set("legacy-row", {
+      idempotency_key: "legacy-row",
+      corridor_id: "c",
+      state: "settled",
+      version: 1,
+      stellar_tx_hash: "old_stellar_tx_hash",
+      settlement_kind: null,
+      settlement_ref: null,
+    });
+
+    const run = await store.get("legacy-row");
+    expect(run?.stellarTxHash).toBe("old_stellar_tx_hash");
+    expect(run?.settlementKind).toBe("stellar");
+    expect(run?.settlementRef).toEqual({
+      kind: "stellar",
+      stellarTxHash: "old_stellar_tx_hash",
+    });
   });
 });

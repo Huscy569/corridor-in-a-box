@@ -1,0 +1,44 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  // oxlint parses TS/TSX with its own Rust parser and never loads the
+  // `typescript` package, so it works under TypeScript 7 where
+  // typescript-eslint does not
+  // (https://github.com/typescript-eslint/typescript-eslint/issues/10940).
+  // Setting `plugins` overwrites oxlint's base set, so list them all:
+  // `react` also enables the eslint-plugin-react-hooks rules (oxlint has no
+  // separate react-hooks plugin id), and `typescript` stays on explicitly.
+  "plugins": ["eslint", "typescript", "react", "jsx-a11y", "nextjs"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error"
+  },
+  "env": {
+    "browser": true,
+    "node": true,
+    "es2024": true
+  },
+  "settings": {
+    "react": {
+      "version": "19.3.0"
+    }
+  },
+  "ignorePatterns": [".next/**", "node_modules/**", "out/**", "dist/**"],
+  "rules": {
+    // Next.js compiles JSX with the automatic runtime, so a React import is
+    // never needed in .tsx — same reason eslint-config-next disables these.
+    // (oxlint does not implement react/jsx-uses-react; nothing to pair.)
+    "react/react-in-jsx-scope": "off"
+  },
+  "overrides": [
+    {
+      // ThemeToggle mirrors into state the class that the pre-hydration inline
+      // theme script put on <html>. That DOM element is an external system
+      // React does not own, so a mount effect is the sanctioned pattern; state
+      // changes after that happen in the click handler, not the effect.
+      "files": ["components/layout/ThemeToggle.tsx"],
+      "rules": {
+        "react/set-state-in-effect": "off"
+      }
+    }
+  ]
+}

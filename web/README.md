@@ -2,19 +2,28 @@
 
 A small Next.js (App Router, Tailwind v4) frontend for the engine:
 
-- **Dashboard** — the corridors with build-time liveness in three states —
-  `verified` / `unverified` / `not runnable` — where only `verified` counts as
-  runnable (`lib/corridors.ts`, `liveness()`).
+- **Dashboard** — every corridor in `../corridors/` with its liveness —
+  `proven` / `verified` / `unverified` / `not runnable` — where only `proven` and
+  `verified` count as runnable (`lib/corridors.ts`, using `liveness()` from
+  `@corridor/manifest`).
 - **Run a payment** — drive a payment through the engine and watch it walk the
   state machine, including the idempotent replay.
 - **Docs** — overview, getting started, architecture, HTTP API, key management, and
   why not Anchor Platform? (the six pages in `lib/docs.ts`).
 
+The corridor data and the state-machine list are not hand-copied. They are
+generated into `lib/generated/` from the manifests and
+`packages/engine/src/state.ts`. After editing either, run `pnpm gen:web-data`
+from the repo root and commit the result. CI fails when the committed files
+are out of date.
+
 Since [#80](https://github.com/ezedike-evan/corridor-in-a-box/pull/80) `web/` is
 its own pnpm workspace root (`web/pnpm-workspace.yaml`, with its own lockfile), so
-it builds and runs on its own — gated by its own CI job (`pnpm typecheck` +
-`pnpm build`, see `.github/workflows/ci.yml`) rather than by the monorepo's
-test/lint gate.
+it builds and runs on its own — gated by its own CI job (`pnpm lint` +
+`pnpm typecheck` + `pnpm build`, see `.github/workflows/ci.yml`) rather than by
+the monorepo's test/lint gate. Lint is [oxlint](https://oxc.rs/docs/guide/usage/linter.html)
+(`.oxlintrc.json`), not ESLint: ESLint's TypeScript parser refuses TS 7, while
+oxlint parses TS with its own Rust parser.
 
 ## Develop
 
@@ -25,6 +34,7 @@ pnpm dev      # http://localhost:3000
 ```
 
 ```bash
+pnpm lint
 pnpm typecheck
 pnpm build
 ```

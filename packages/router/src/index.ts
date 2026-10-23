@@ -13,12 +13,25 @@ import type { PaymentIntent } from "@corridor/types";
 export interface RouteDecision {
   /** The receiving anchor chosen for this payment. */
   readonly receiving: AnchorAdapter;
-  /** Reserved for split routing across multiple anchors (weights sum to 1). */
+  /**
+   * Reserved for split routing across multiple anchors (weights sum to 1).
+   * The engine ignores this field today and reads only `receiving`, so setting
+   * it does not change where a payment goes. See docs/route-resolver.md#split.
+   */
   readonly split?: ReadonlyArray<{ adapter: AnchorAdapter; weight: number }>;
   /** How the route decision was reached: verified against on-chain evidence or assumed from manifest. */
   readonly trust: "attested" | "manifest";
 }
 
+/**
+ * Chooses the receiving anchor for a payment. This is the open/closed seam.
+ *
+ * The engine may call `resolve()` more than once for the same payment (on the
+ * first run and again on resume), so the result should be stable for the same
+ * inputs. `resolve()` may throw to fail closed: `RegistryRouteResolver` throws
+ * `UnattestedAnchorError` rather than return a route it cannot vouch for. The
+ * full contract is in docs/route-resolver.md#the-routeresolver-interface.
+ */
 export interface RouteResolver {
   resolve(intent: PaymentIntent, corridor: Corridor): Promise<RouteDecision>;
 }
@@ -57,8 +70,13 @@ export class StaticRouteResolver implements RouteResolver {
 export {
   RegistryRouteResolver,
   UnattestedAnchorError,
+  asAttestationSource,
+  isAttestedProtocol,
   isUnattestedDomainAllowed,
   type AttestationSource,
+  type AttestationSourceLike,
+  type AttestedProtocol,
+  type LegacyAttestationSource,
   type RegistryResolverOptions,
 } from "./registry-resolver";
 

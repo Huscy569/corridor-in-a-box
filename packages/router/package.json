@@ -6,12 +6,21 @@
     "node": ">=22"
   },
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./testing": "./src/testing.ts"
   },
   "main": "./src/index.ts",
   "dependencies": {
     "@corridor/types": "workspace:*",
     "@corridor/manifest": "workspace:*",
     "@corridor/adapter-kit": "workspace:*"
+  },
+  "peerDependencies": {
+    "vitest": "^2.1.0"
+  },
+  "peerDependenciesMeta": {
+    "vitest": {
+      "optional": true
+    }
   }
 }

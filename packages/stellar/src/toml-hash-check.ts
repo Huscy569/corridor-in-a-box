@@ -1,6 +1,6 @@
 import type { CheckResult, GateCheck } from "@corridor/engine";
 import { isSafeUrl, tomlHash } from "@corridor/probe";
-import { isUnattestedDomainAllowed, type AttestationSource } from "@corridor/router";
+import { isUnattestedDomainAllowed, type AttestationSourceLike } from "@corridor/router";
 
 const CHECK_NAME = "anchor.toml.hash";
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -8,7 +8,11 @@ const HASH_PREFIX_LENGTH = 10;
 const VALID_HASH = /^[0-9a-f]{64}$/;
 
 export interface TomlHashCheckOptions {
-  readonly registry: AttestationSource;
+  /**
+   * The attestation source to read the recorded hash from. Only `tomlHash` is
+   * used, so either shape of source is accepted.
+   */
+  readonly registry: AttestationSourceLike;
   readonly fetchImpl?: typeof fetch;
   readonly timeoutMs?: number;
   readonly allowUnattestedDomains?: readonly string[];

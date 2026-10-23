@@ -47,6 +47,7 @@ CORRIDOR_SIGNER_SECRET=S… pnpm cli canary corridors/reference.corridor.yaml \
   --amount 1.00 --dry-run                          # real anchor up to the pre-settle gate, no payment
 CORRIDOR_SIGNER_SECRET=S… pnpm cli canary corridors/reference.corridor.yaml \
   --amount 1.00 --write                            # MOVES MONEY: canary + proof
+just check                # the three lines above as one; `just ci` runs CI's whole gate, `just --list` shows the rest
 ```
 
 See [CONTRIBUTING](./CONTRIBUTING.md), [SECURITY](./SECURITY.md), and the
@@ -88,8 +89,8 @@ corridors/       the manifests — ALL corridor-specifics live here,
                  nowhere else
 contracts/       Soroban registry + attester contracts
 scripts/         reference-anchor.sh + assert-testnet-corridor.ts
-docs/            key management, bespoke adapters, "why not Anchor Platform",
-                 SEP coverage, operations, …
+docs/            threat model, key management, bespoke adapters,
+                 "why not Anchor Platform", SEP coverage, operations, …
 examples/        runnable end-to-end demo
 ```
 
@@ -198,8 +199,9 @@ Two Soroban contracts, live on testnet:
 | attester | [`CAHSKTAVHIES6MX2DUGNBA4VDB77WYNKEIZPOT7QX2RMJUL5RUIVKX2L`](https://stellar.expert/explorer/testnet/contract/CAHSKTAVHIES6MX2DUGNBA4VDB77WYNKEIZPOT7QX2RMJUL5RUIVKX2L) |
 
 The registry stores **facts**: which SEPs a domain advertises, the SHA-256 of the
-`stellar.toml` they were read from, which conformance probes passed, and the
-ledger someone last checked. No score, no ranking, no recommendation — those are
+`stellar.toml` they were read from, which conformance probes passed, which assets
+it was _observed_ receiving, the country it _declared_ itself in, and the ledger
+someone last checked. No score, no ranking, no recommendation — those are
 judgements, they depend on your risk appetite, and they belong in your
 `RouteResolver`, not in a public record. **Verifiable facts are the public good;
 the interpretation is the product.**
@@ -216,6 +218,8 @@ testanchor.stellar.org
   advertises     SEP-1, SEP-6, SEP-10, SEP-12, SEP-24, SEP-31, SEP-38
   probes passed  toml_fetch, sep10_auth, sep38_quote, sep12_status
   probes FAILED  sep31_info
+  receives       not recorded
+  declared in    no country declared
   attested at    ledger 4032636
   serves SEP-31  NO
 
@@ -227,6 +231,24 @@ Anything reading the toml alone would call the lane runnable. `serves_sep31()`
 returns `NO` because it requires the capability to be both advertised _and_
 probed green — the same distinction the four-state liveness above enforces, now
 as a public artifact anyone can check rather than a claim in this repo.
+
+### What it says when it does not know
+
+Each record also carries the assets the SEP-31 `/info` response was **observed**
+listing, and the country the anchor **declared** in its own
+`ORG_PHYSICAL_ADDRESS` — two kinds of fact, and the reader keeps them apart:
+`receiveAssets` is what a probe saw, `country` is what the anchor said about
+itself, verified by nobody. Both are written by a separate `attest_meta` call,
+under their own storage key and their own cooldown, so an attester already in the
+field keeps working and a sweep can write both halves in one ledger.
+
+The two lines above read `not recorded` and `no country declared` because that
+record was written before the metadata existed. That is the case the design has
+to survive: a domain with no metadata is `NotFound` on chain and absent in the
+decoded record, never an empty list — because "we asked and it receives nothing"
+is a finding, and printing it for a question nobody asked would rebuild exactly
+the mistake the registry exists to correct. Full reasoning, bounds and the
+upgrade path are in [`docs/registry-metadata.md`](docs/registry-metadata.md).
 
 Every record carries `attested_ledger`, so staleness is visible on chain. An
 attestation is never wrong, only old, and a consumer must be able to see the
@@ -245,7 +267,9 @@ operation, `stellar contract restore`); see the header of
 pnpm probe:anchor testanchor.stellar.org   # probe a live anchor, print the facts
 pnpm registry:read                         # read the registry via @corridor/registry
 pnpm registry:read --sep 24 --passed sep10_auth   # filter; --max-age and --json too
-cd contracts && cargo test                 # 39 contract tests
+pnpm registry:read --country MX --asset MXN        # who pays out MXN, declared in MX
+ATTESTER_SECRET=S… pnpm attest             # probe + submit both halves: bitmaps, then observed assets and declared country
+cd contracts && cargo test                 # 68 contract tests
 ```
 
 ## Proof against a real SEP-31 anchor

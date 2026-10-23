@@ -20,6 +20,8 @@ import type { CorridorState } from "./state";
 // uses it rather than being duplicated here. This file does not import
 // breaker-pg's types, so there is no module cycle at runtime.
 import { CREATE_BREAKERS_TABLE_SQL, BREAKERS_MIGRATION_SQL } from "./breaker-pg";
+// Same arrangement for the audit table: audit-pg imports only types from here.
+import { CREATE_AUDIT_TABLE_SQL } from "./audit-pg";
 
 export interface QueryResult<R = Record<string, unknown>> {
   rows: R[];
@@ -46,6 +48,8 @@ create table if not exists corridor_runs (
   quote_firm      boolean,
   settlement_amount text,
   stellar_tx_hash text,
+  settlement_kind text,
+  settlement_ref  text,
   deposit_address text,
   memo            text,
   memo_type       text,
@@ -95,6 +99,9 @@ const ALTER_TABLE_SQL = [
   `alter table corridor_runs add column if not exists created_at timestamptz not null default now(); `,
   // Stable hash of the validated corridor manifest under which the run started.
   `alter table corridor_runs add column if not exists manifest_hash text;`,
+  // Settlement kind and reference for off-chain / adapter-settled transactions (#186).
+  `alter table corridor_runs add column if not exists settlement_kind text;`,
+  `alter table corridor_runs add column if not exists settlement_ref text;`,
 ];
 
 /**
@@ -111,6 +118,9 @@ export async function migrate(db: Queryable): Promise<void> {
   await db.query(CREATE_RESOLUTIONS_TABLE_SQL);
   for (const sql of ALTER_TABLE_SQL) await db.query(sql);
   await db.query(CREATE_LIST_INDEX_SQL);
+  // The append-only audit trail (audit-pg.ts) ships from the same entry point,
+  // so a deployment cannot end up with runs but no audit table.
+  await db.query(CREATE_AUDIT_TABLE_SQL);
   // The circuit-breaker table ships from the same entry point on purpose. It is
   // one more `create table if not exists`, so a deployment that has not run
   // migrate() since upgrading would get breaker errors on every payment — the
@@ -134,6 +144,8 @@ interface Row {
   quote_firm: boolean | null;
   settlement_amount: string | null;
   stellar_tx_hash: string | null;
+  settlement_kind: string | null;
+  settlement_ref: string | null;
   deposit_address: string | null;
   memo: string | null;
   memo_type: string | null;
@@ -145,6 +157,25 @@ interface Row {
 }
 
 function toRun(r: Row): StoredRun {
+  let settlementRef: StoredRun["settlementRef"];
+  if (r.settlement_ref) {
+    try {
+      settlementRef = JSON.parse(r.settlement_ref);
+    } catch {
+      // ignore
+    }
+  } else if (r.stellar_tx_hash) {
+    settlementRef = {
+      kind: "stellar",
+      stellarTxHash: r.stellar_tx_hash,
+    };
+  }
+
+  const settlementKind =
+    (r.settlement_kind as StoredRun["settlementKind"]) ??
+    settlementRef?.kind ??
+    (r.stellar_tx_hash ? "stellar" : undefined);
+
   return {
     idempotencyKey: r.idempotency_key,
     corridorId: r.corridor_id,
@@ -157,6 +188,8 @@ function toRun(r: Row): StoredRun {
     quoteFirm: r.quote_firm ?? undefined,
     settlementAmount: r.settlement_amount ?? undefined,
     stellarTxHash: r.stellar_tx_hash ?? undefined,
+    settlementKind,
+    settlementRef,
     depositAddress: r.deposit_address ?? undefined,
     memo: r.memo ?? undefined,
     memoType: (r.memo_type as StoredRun["memoType"]) ?? undefined,
@@ -193,9 +226,9 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
       `insert into corridor_runs
          (idempotency_key, corridor_id, state, version, transaction_id,
           quote_id, quote_expires_at, quote_firm, settlement_amount,
-          stellar_tx_hash, deposit_address, memo, memo_type,
+          stellar_tx_hash, settlement_kind, settlement_ref, deposit_address, memo, memo_type,
           refund_id, last_error, owner, settlement, manifest_hash, created_at, updated_at)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18, now(), now())
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20, now(), now())
        on conflict (idempotency_key) do nothing
        returning idempotency_key`,
       [
@@ -209,6 +242,8 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
         run.quoteFirm ?? null,
         run.settlementAmount ?? null,
         run.stellarTxHash ?? null,
+        run.settlementKind ?? null,
+        run.settlementRef ? JSON.stringify(run.settlementRef) : null,
         run.depositAddress ?? null,
         run.memo ?? null,
         run.memoType ?? null,
@@ -226,7 +261,7 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
     const res = await this.db.query<Row>(
       `select idempotency_key, corridor_id, state, version, transaction_id,
               quote_id, quote_expires_at, quote_firm, settlement_amount,
-              stellar_tx_hash, deposit_address, memo, memo_type,
+              stellar_tx_hash, settlement_kind, settlement_ref, deposit_address, memo, memo_type,
               refund_id, last_error, owner, settlement, manifest_hash, created_at
          from corridor_runs where idempotency_key = $1`,
       [key],
@@ -247,7 +282,7 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
     const limitParam = `$${params.length}`;
     const result = await this.db.query<Row>(
       `select idempotency_key, corridor_id, state, version, transaction_id,
-              quote_id, stellar_tx_hash, refund_id, last_error, owner, manifest_hash, created_at
+              quote_id, stellar_tx_hash, settlement_kind, settlement_ref, refund_id, last_error, owner, manifest_hash, created_at
          from corridor_runs where state = $1 ${corridor}
         order by updated_at desc, idempotency_key asc limit ${limitParam}`,
       params,
@@ -324,9 +359,9 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
       `insert into corridor_runs
          (idempotency_key, corridor_id, state, version, transaction_id,
           quote_id, quote_expires_at, quote_firm, settlement_amount,
-          stellar_tx_hash, deposit_address, memo, memo_type,
+          stellar_tx_hash, settlement_kind, settlement_ref, deposit_address, memo, memo_type,
           refund_id, last_error, owner, settlement, manifest_hash, updated_at)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18, now())
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20, now())
        on conflict (idempotency_key) do update set
          manifest_hash   = coalesce(corridor_runs.manifest_hash, excluded.manifest_hash),
          state           = excluded.state,
@@ -337,6 +372,8 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
          quote_firm      = excluded.quote_firm,
          settlement_amount = excluded.settlement_amount,
          stellar_tx_hash = excluded.stellar_tx_hash,
+         settlement_kind = coalesce(excluded.settlement_kind, corridor_runs.settlement_kind),
+         settlement_ref  = coalesce(excluded.settlement_ref, corridor_runs.settlement_ref),
          deposit_address = excluded.deposit_address,
          memo            = excluded.memo,
          memo_type       = excluded.memo_type,
@@ -356,6 +393,8 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
         run.quoteFirm ?? null,
         run.settlementAmount ?? null,
         run.stellarTxHash ?? null,
+        run.settlementKind ?? null,
+        run.settlementRef ? JSON.stringify(run.settlementRef) : null,
         run.depositAddress ?? null,
         run.memo ?? null,
         run.memoType ?? null,

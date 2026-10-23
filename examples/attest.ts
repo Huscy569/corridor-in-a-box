@@ -8,6 +8,11 @@
 // exactly what it found — the point of the registry is that nobody, including
 // this script, gets to assert a capability that was not observed.
 //
+// Each domain is written in two calls: the bitmaps, and the metadata (the
+// receive assets SEP-31 actually listed, plus the country the anchor declared).
+// The second is skipped when the probe never produced a receive list, because
+// not-recording and recording-nothing are different claims.
+//
 // The signing key must have been enrolled with `add_attester`. Reading the
 // registry needs no key at all; see `pnpm registry:read`.
 
@@ -108,6 +113,24 @@ async function main(): Promise<void> {
       console.log(
         `  ${cooldown ? "•" : "✗"} ${submitted.error.code}: ${submitted.error.message}\n`,
       );
+      if (!cooldown) failures += 1;
+    }
+
+    // The metadata half, only when the probe actually observed something. An
+    // anchor with no working SEP-31 endpoint has no receive list to report, and
+    // writing an empty one would record "we asked and it accepts nothing" for a
+    // question that was never put.
+    if (result.receiveAssets === undefined) continue;
+    const meta = await attester.attestMeta(result);
+    const declared = result.country ? ` · declared ${result.country}` : "";
+    if (meta.ok) {
+      console.log(
+        `  ✓ meta      ${result.receiveAssets.join(", ") || "no receivable assets"}${declared}` +
+          ` — ${meta.value.txHash} (ledger ${meta.value.ledger})\n`,
+      );
+    } else {
+      const cooldown = meta.error.contractError === AttesterContractError.TooSoon;
+      console.log(`  ${cooldown ? "•" : "✗"} ${meta.error.code}: ${meta.error.message}\n`);
       if (!cooldown) failures += 1;
     }
   }

@@ -17,8 +17,11 @@ import {
   type Money,
   type Outcome,
   type PaymentIntent,
+  type SettlementRef,
+  settlementId,
 } from "@corridor/types";
 
+export { type SettlementRef, settlementId };
 export { Sep10Client, jwtExpiryMs, type Sep10Signer } from "./sep10";
 
 /** A SEP-38 quote. `firm` quotes carry an id + expiry and bind the deliverer to a rate. */
@@ -584,6 +587,11 @@ export interface AnchorAdapter {
   /** Poll transaction status for reconciliation. */
   getTransaction(transactionId: string): Promise<Outcome<TransactionStatus>>;
   /**
+   * For off-chain / adapter-settled transactions (#186): confirm that settlement
+   * moved off-chain and obtain a SettlementRef with the adapter's reference.
+   */
+  confirmSettlement?(transactionId: string): Promise<Outcome<SettlementRef>>;
+  /**
    * Request a refund from the receiving anchor.
    *
    * Refunds are anchor-driven operations, NOT unilateral on-chain reversals.
@@ -664,6 +672,10 @@ export interface MockAdapterOptions {
   refundStatus?: RefundInfo;
   /** Override individual fields of the reported `capabilities()`. */
   capabilities?: Partial<AdapterCapabilities>;
+  /** Custom confirmSettlement handler or result for mock testing. */
+  confirmSettlementResult?: Outcome<SettlementRef>;
+  /** Deposit instructions for openTransaction to report. */
+  instructions?: DepositInstructions;
 }
 
 export function createMockAdapter(opts: MockAdapterOptions = {}): AnchorAdapter {
@@ -679,11 +691,14 @@ export function createMockAdapter(opts: MockAdapterOptions = {}): AnchorAdapter 
   return {
     name,
     capabilities() {
+      const defaultSettlement: readonly DepositInstructions["kind"][] = opts.instructions?.kind
+        ? [opts.instructions.kind]
+        : ["stellar_payment"];
       return {
         protocol: "mock",
         quotes: ["sep38_firm"],
         kyc: "sep12",
-        settlement: ["stellar_payment"],
+        settlement: defaultSettlement,
         refunds: "request",
         callbacks: false,
         ...opts.capabilities,
@@ -704,7 +719,7 @@ export function createMockAdapter(opts: MockAdapterOptions = {}): AnchorAdapter 
       return ok<KycResult>({ status: opts.kyc ?? "accepted", customerId: "cust_mock" });
     },
     async openTransaction(_intent, quote) {
-      const instructions: DepositInstructions = {
+      const instructions: DepositInstructions = opts.instructions ?? {
         kind: "stellar_payment",
         to: "GMOCK000000000000000000000000000000000000000000000000",
         memo: "mock-memo",
@@ -713,8 +728,8 @@ export function createMockAdapter(opts: MockAdapterOptions = {}): AnchorAdapter 
         transactionId: `tx_${++counter}`,
         instructions,
         amountIn: quote.sourceAmount,
-        depositAddress: instructions.to,
-        memo: instructions.memo,
+        depositAddress: instructions.kind === "stellar_payment" ? instructions.to : undefined,
+        memo: instructions.kind === "stellar_payment" ? instructions.memo : undefined,
       };
       opened.set(tx.transactionId, {
         amountIn: quote.sourceAmount,
@@ -740,6 +755,14 @@ export function createMockAdapter(opts: MockAdapterOptions = {}): AnchorAdapter 
         settled: opts.settled !== false,
         refunds: opts.refundStatus,
         ...expected,
+      });
+    },
+    async confirmSettlement(transactionId) {
+      if (opts.confirmSettlementResult) return opts.confirmSettlementResult;
+      return ok<SettlementRef>({
+        kind: "adapter",
+        reference: `adapter_ref_${transactionId}`,
+        reportedAt: Date.now(),
       });
     },
     async requestRefund(transactionId, amount, reason) {

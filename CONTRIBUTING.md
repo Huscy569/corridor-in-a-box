@@ -30,7 +30,56 @@ pnpm example             # run a payment end-to-end (mocked anchor + settle)
 ```
 
 Node 22+ and pnpm 9+ are required (see `.nvmrc` and `packageManager` in
-`package.json`).
+`package.json`), and the contracts need a Rust toolchain with the
+`wasm32v1-none` target. The dev container below sets all of it up for you.
+
+The commands CI runs are also collected in the [`justfile`](./justfile), so you
+do not have to read `.github/workflows/ci.yml` to find them. `just --list` shows
+every recipe; `just ci` runs the whole gate.
+
+```bash
+cargo install just       # or brew install just, or https://github.com/casey/just#installation
+just install             # both pnpm roots: the monorepo and web/
+just check               # lint, typecheck, test
+just contracts           # cargo fmt --check, clippy -D warnings, test, wasm build
+just ci                  # all of the above, plus web and the Postgres test
+```
+
+### Dev container
+
+`.devcontainer/` captures that toolchain as code, for a fresh machine or a
+GitHub Codespace:
+
+- Node 22 (the `engines` floor) from the TypeScript devcontainer image, with
+  pnpm resolved through corepack from `packageManager` (`pnpm@9.12.0`)
+- Rust stable with `rustfmt`, `clippy` and the `wasm32v1-none` target — the same
+  toolchain CI's `contracts` job installs
+- a `postgres:16` service with `CORRIDOR_TEST_DATABASE_URL` already pointing at
+  it, so the Postgres-backed tests need no database setup of their own (the
+  crash-resume Postgres cases still need the live-anchor variables, as on a bare
+  machine)
+- `git`, so the `prepare` script can install lefthook's hooks
+
+Open it with **Reopen in Container** in VS Code (Dev Containers extension) or
+**Code → Codespaces → Create codespace** on GitHub. It installs both pnpm roots
+on create, after which these run as-is:
+
+```bash
+pnpm typecheck
+pnpm test            # also runs the Postgres suite, since the DB is configured
+pnpm exec vitest run tests/integration/idempotency-pg.test.ts
+cd contracts && cargo test
+```
+
+The reference-anchor stack is the one thing that does not work here:
+`scripts/reference-anchor.sh` drives rootless **podman** on the host, and a dev
+container has no nested container runtime. Docker-in-Docker would not help — it
+provides docker, while the script and `just anchor-up` call podman. `just` and
+`gitleaks` are not installed either, so the `justfile` stays the host workflow;
+`just pg-test` is redundant in here in any case, since it starts its own
+Postgres on 5432 while `CORRIDOR_TEST_DATABASE_URL` already points at the `db`
+service. Run `pnpm` and `cargo` directly in the container, and `just ci` /
+`just anchor-up` on the host.
 
 ## Git hooks
 
@@ -49,7 +98,16 @@ full gate.
 
 ## Before you open a PR
 
-Run the full gate locally — CI runs the same three commands:
+Run the full gate locally. `just ci` runs the same steps as CI's build,
+contracts, web and integration-postgres jobs; CI also has a gitleaks job, whose
+local equivalent is `just secret-scan`. `just ci` needs a container runtime for
+the Postgres job — without one, run `just check && just contracts && just web`.
+
+```bash
+just ci
+```
+
+Or, without `just`, the three commands the monorepo gate is made of:
 
 ```bash
 pnpm lint && pnpm typecheck && pnpm test
@@ -60,6 +118,29 @@ pnpm lint && pnpm typecheck && pnpm test
   through the mock adapter / mock submitter (see `tests/engine.test.ts`).
 - Update the README or relevant doc when you change a public interface.
 - Do **not** commit secrets, signing keys, or `.env` files.
+
+### Quarantining a flaky test
+
+Don't delete or `.skip` a test that flakes. Open an issue for it, then wrap it in
+`quarantine()` from `tests/helpers/quarantine.ts`, giving the issue URL first:
+
+```ts
+quarantine(
+  "https://github.com/ezedike-evan/corridor-in-a-box/issues/123",
+  "socket 413",
+  () => {
+    it("rejects a body over the cap", async () => {
+      /* … */
+    });
+  },
+);
+```
+
+`pnpm test` skips quarantined blocks. `pnpm test:quarantine` runs only those
+blocks, retrying each test up to 3 times. The non-blocking `quarantine` CI job
+lists every quarantined test, its issue, and how it did in the job summary.
+`tests/quarantine.test.ts` fails if a `quarantine()` call has no issue URL.
+Once the issue is fixed, remove the wrapper.
 
 ## Commit messages
 

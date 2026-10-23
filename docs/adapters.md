@@ -8,6 +8,26 @@ This guide documents the engine invariants, the method-by-method contract, error
 
 ---
 
+## Worked example
+
+`examples/adapters/http-stub/` is a complete, runnable adapter for a bespoke
+anchor, wired the way this guide describes: a fictional HTTP API served
+in-process by an injected `fetchImpl`, an adapter that reports `native` quotes,
+`bespoke` KYC and `stellar_payment` deposit instructions, a manifest declaring
+`protocol: custom:http-stub` and `endpoints.base_url`, and a conformance run in
+the test suite. Run it with:
+
+```sh
+pnpm example:stub
+```
+
+Everything in that example is fictional — `anchor.example`, invented routes, a
+made-up payout asset — so it can be read, copied and run without touching a
+real anchor or a real network. `tests/http-stub-adapter.test.ts` fails if a
+URL in the example points anywhere but a reserved example domain.
+
+---
+
 ## The `AnchorAdapter` contract
 
 Every adapter implements the `AnchorAdapter` interface defined in `packages/adapter-kit/src/index.ts`:

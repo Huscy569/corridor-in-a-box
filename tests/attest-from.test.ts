@@ -156,3 +156,65 @@ describe("attest-from probe results loader (#238)", () => {
     });
   });
 });
+
+describe("attest-from metadata round trip (#242)", () => {
+  const withMeta: ProbeResult = {
+    ...sampleResult,
+    probesPassed: sampleResult.probesPassed | probeBit("sep31_info"),
+    receiveAssets: ["NGN", "KES"],
+    country: "NG",
+  };
+
+  /** Serialize the way a sweep writes its results file, then load it back. */
+  const roundTrip = (result: ProbeResult): ProbeResult =>
+    parseProbeResults(JSON.stringify([JSON.parse(formatProbeResultJson(result))]))[0];
+
+  it("carries the observed list and declared country through the file", () => {
+    const loaded = roundTrip(withMeta);
+    expect(loaded.receiveAssets).toEqual(["NGN", "KES"]);
+    expect(loaded.country).toBe("NG");
+  });
+
+  it("carries an empty list as the finding rather than dropping it", () => {
+    const loaded = roundTrip({ ...withMeta, receiveAssets: [] });
+    expect(loaded.receiveAssets).toEqual([]);
+  });
+
+  it("accepts the list under the name sep31ReceiveAssets and exposes both names", () => {
+    const loaded = parseProbeResults([
+      { ...sampleResult, sep31ReceiveAssets: ["NGN", "KES"] },
+    ])[0]!;
+    expect(loaded.receiveAssets).toEqual(["NGN", "KES"]);
+    expect(loaded.sep31ReceiveAssets).toEqual(["NGN", "KES"]);
+  });
+
+  it("applies the same checks to sep31ReceiveAssets", () => {
+    expect(() =>
+      parseProbeResults({ ...sampleResult, sep31ReceiveAssets: ["NGN", ""] }),
+    ).toThrow(/invalid receiveAssets/);
+  });
+
+  it("loads a result written before metadata existed", () => {
+    const loaded = roundTrip(sampleResult);
+    expect("receiveAssets" in loaded).toBe(false);
+    expect("country" in loaded).toBe(false);
+  });
+
+  it("refuses a country that is not alpha-2", () => {
+    expect(() => parseProbeResults({ ...sampleResult, country: "Nigeria" })).toThrow(
+      /invalid country/,
+    );
+    expect(() => parseProbeResults({ ...sampleResult, country: "Ng" })).toThrow(
+      /invalid country/,
+    );
+  });
+
+  it("refuses a receive list that is not a list of codes", () => {
+    expect(() => parseProbeResults({ ...sampleResult, receiveAssets: "NGN,KES" })).toThrow(
+      /invalid receiveAssets/,
+    );
+    expect(() => parseProbeResults({ ...sampleResult, receiveAssets: ["NGN", ""] })).toThrow(
+      /invalid receiveAssets/,
+    );
+  });
+});
