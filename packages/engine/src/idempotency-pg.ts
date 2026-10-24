@@ -43,6 +43,7 @@ create table if not exists corridor_runs (
   state           text not null,
   version         integer not null,
   transaction_id  text,
+  source_transaction_id text,
   quote_id        text,
   quote_expires_at bigint,
   quote_firm      boolean,
@@ -88,10 +89,11 @@ const ALTER_TABLE_SQL = [
   `alter table corridor_runs add column if not exists memo text; `,
   `alter table corridor_runs add column if not exists memo_type text; `,
   // JSON of what the settle leg was asked to pay, so a resumed run can re-verify it on-chain.
-  `alter table corridor_runs add column if not exists settlement text; `,
-  `alter table corridor_runs add column if not exists quote_expires_at bigint; `,
-  `alter table corridor_runs add column if not exists quote_firm boolean; `,
-  `alter table corridor_runs add column if not exists settlement_amount text; `,
+  `alter table corridor_runs add column if not exists settlement text;`,
+  `alter table corridor_runs add column if not exists source_transaction_id text;`,
+  `alter table corridor_runs add column if not exists quote_expires_at bigint;`,
+  `alter table corridor_runs add column if not exists quote_firm boolean;`,
+  `alter table corridor_runs add column if not exists settlement_amount text;`,
   // created_at is the primary sort key for GET /payments. Adding it to an
   // existing table backfills every row to now() -- the best available answer
   // for rows written before the column existed. New rows get the real creation
@@ -139,6 +141,7 @@ interface Row {
   state: string;
   version: number;
   transaction_id: string | null;
+  source_transaction_id: string | null;
   quote_id: string | null;
   quote_expires_at: number | string | null;
   quote_firm: boolean | null;
@@ -183,6 +186,7 @@ function toRun(r: Row): StoredRun {
     state: r.state as CorridorState,
     version: r.version,
     transactionId: r.transaction_id ?? undefined,
+    sourceTransactionId: r.source_transaction_id ?? undefined,
     quoteId: r.quote_id ?? undefined,
     quoteExpiresAt: r.quote_expires_at == null ? undefined : Number(r.quote_expires_at),
     quoteFirm: r.quote_firm ?? undefined,
@@ -224,11 +228,11 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
   async create(run: StoredRun): Promise<boolean> {
     const res = await this.db.query<{ idempotency_key: string }>(
       `insert into corridor_runs
-         (idempotency_key, corridor_id, state, version, transaction_id,
+         (idempotency_key, corridor_id, state, version, transaction_id, source_transaction_id,
           quote_id, quote_expires_at, quote_firm, settlement_amount,
           stellar_tx_hash, settlement_kind, settlement_ref, deposit_address, memo, memo_type,
           refund_id, last_error, owner, settlement, manifest_hash, created_at, updated_at)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20, now(), now())
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21, now(), now())
        on conflict (idempotency_key) do nothing
        returning idempotency_key`,
       [
@@ -237,6 +241,7 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
         run.state,
         run.version,
         run.transactionId ?? null,
+        run.sourceTransactionId ?? null,
         run.quoteId ?? null,
         run.quoteExpiresAt ?? null,
         run.quoteFirm ?? null,
@@ -259,7 +264,7 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
 
   async get(key: string): Promise<StoredRun | undefined> {
     const res = await this.db.query<Row>(
-      `select idempotency_key, corridor_id, state, version, transaction_id,
+      `select idempotency_key, corridor_id, state, version, transaction_id, source_transaction_id,
               quote_id, quote_expires_at, quote_firm, settlement_amount,
               stellar_tx_hash, settlement_kind, settlement_ref, deposit_address, memo, memo_type,
               refund_id, last_error, owner, settlement, manifest_hash, created_at
@@ -281,7 +286,7 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
     params.push(limit);
     const limitParam = `$${params.length}`;
     const result = await this.db.query<Row>(
-      `select idempotency_key, corridor_id, state, version, transaction_id,
+      `select idempotency_key, corridor_id, state, version, transaction_id, source_transaction_id,
               quote_id, stellar_tx_hash, settlement_kind, settlement_ref, refund_id, last_error, owner, manifest_hash, created_at
          from corridor_runs where state = $1 ${corridor}
         order by updated_at desc, idempotency_key asc limit ${limitParam}`,
@@ -357,16 +362,17 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
   async put(run: StoredRun): Promise<void> {
     await this.db.query(
       `insert into corridor_runs
-         (idempotency_key, corridor_id, state, version, transaction_id,
+         (idempotency_key, corridor_id, state, version, transaction_id, source_transaction_id,
           quote_id, quote_expires_at, quote_firm, settlement_amount,
           stellar_tx_hash, settlement_kind, settlement_ref, deposit_address, memo, memo_type,
           refund_id, last_error, owner, settlement, manifest_hash, updated_at)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20, now())
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21, now())
        on conflict (idempotency_key) do update set
          manifest_hash   = coalesce(corridor_runs.manifest_hash, excluded.manifest_hash),
          state           = excluded.state,
          version         = excluded.version,
          transaction_id  = excluded.transaction_id,
+         source_transaction_id = coalesce(corridor_runs.source_transaction_id, excluded.source_transaction_id),
          quote_id        = excluded.quote_id,
          quote_expires_at = excluded.quote_expires_at,
          quote_firm      = excluded.quote_firm,
@@ -388,6 +394,7 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
         run.state,
         run.version,
         run.transactionId ?? null,
+        run.sourceTransactionId ?? null,
         run.quoteId ?? null,
         run.quoteExpiresAt ?? null,
         run.quoteFirm ?? null,
